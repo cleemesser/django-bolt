@@ -19,6 +19,7 @@ import httpx
 from httpx import Response
 
 from django_bolt import BoltAPI, _core
+from django_bolt.api import _validate_asgi_mount_conflicts
 
 try:
     from django.conf import settings
@@ -309,6 +310,11 @@ class TestClient(httpx.Client):
         except (ImportError, AttributeError):
             return None
 
+    @staticmethod
+    def _validate_asgi_mount_conflicts(api: BoltAPI) -> None:
+        """Validate exact-path conflicts for ASGI mounts (same rule as production startup)."""
+        _validate_asgi_mount_conflicts(api._routes, getattr(api, "_asgi_mounts", []))
+
     def __init__(
         self,
         api: BoltAPI,
@@ -360,6 +366,9 @@ class TestClient(httpx.Client):
         debug = getattr(settings, "DEBUG", False) if settings else False
         self.app_id = _core.create_test_app(api._dispatch, debug, cors_config, trailing_slash, static_config)
 
+        # Validate mount collisions to mirror production startup behavior.
+        self._validate_asgi_mount_conflicts(api)
+
         # Register routes
         rust_routes = [(method, path, handler_id, handler) for method, path, handler_id, handler in api._routes]
         _core.register_test_routes(self.app_id, rust_routes)
@@ -373,6 +382,10 @@ class TestClient(httpx.Client):
             ws_routes.append((path, handler_id, handler, injector))
         if ws_routes:
             _core.register_test_websocket_routes(self.app_id, ws_routes)
+
+        # Register HTTP ASGI mounts
+        if api._asgi_mounts:
+            _core.register_test_asgi_mounts(self.app_id, list(api._asgi_mounts))
 
         # Register middleware metadata if any exists
         if api._handler_middleware:
@@ -582,6 +595,9 @@ class AsyncTestClient(httpx.AsyncClient):
         debug = getattr(settings, "DEBUG", False) if settings else False
         self.app_id = _core.create_test_app(api._dispatch, debug, cors_config, trailing_slash, static_config)
 
+        # Validate mount collisions to mirror production startup behavior.
+        TestClient._validate_asgi_mount_conflicts(api)
+
         # Register routes
         rust_routes = [(method, path, handler_id, handler) for method, path, handler_id, handler in api._routes]
         _core.register_test_routes(self.app_id, rust_routes)
@@ -594,6 +610,10 @@ class AsyncTestClient(httpx.AsyncClient):
             ws_routes.append((path, handler_id, handler, injector))
         if ws_routes:
             _core.register_test_websocket_routes(self.app_id, ws_routes)
+
+        # Register HTTP ASGI mounts
+        if api._asgi_mounts:
+            _core.register_test_asgi_mounts(self.app_id, list(api._asgi_mounts))
 
         # Register middleware metadata
         if api._handler_middleware:

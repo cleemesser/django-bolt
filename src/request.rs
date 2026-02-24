@@ -4,21 +4,32 @@ use pyo3::types::{PyBytes, PyDict, PyString};
 use std::sync::OnceLock;
 
 /// Parse host:port from Actix's connection_info().host()
-/// Returns (hostname, port_string) - port defaults to "80"
+/// Returns (hostname, port_string) - port defaults to "443" for HTTPS, else "80"
 #[inline]
-fn parse_host_port(host: &str) -> (&str, &str) {
+fn parse_host_port<'a>(host: &'a str, scheme: &str) -> (&'a str, u16) {
+    let default_port = if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
+    };
+
     // IPv6 with brackets: [::1]:8080 or [::1]
     if let Some(bracket_end) = host.find(']') {
         // Check for port after closing bracket
         if host.len() > bracket_end + 2 && host.as_bytes()[bracket_end + 1] == b':' {
-            return (&host[..bracket_end + 1], &host[bracket_end + 2..]);
+            if let Ok(port) = host[bracket_end + 2..].parse::<u16>() {
+                return (&host[..bracket_end + 1], port);
+            }
         }
-        return (&host[..bracket_end + 1], "80");
+        return (&host[..bracket_end + 1], default_port);
     }
     // IPv4/hostname: split on last colon
     match host.rsplit_once(':') {
-        Some((name, port)) if port.parse::<u16>().is_ok() => (name, port),
-        _ => (host, "80"),
+        Some((name, port)) => match port.parse::<u16>() {
+            Ok(parsed) => (name, parsed),
+            Err(_) => (host, default_port),
+        },
+        _ => (host, default_port),
     }
 }
 
@@ -243,9 +254,9 @@ impl PyRequest {
 
         // Server info from Actix's connection_info() - handles IPv6 and proxies correctly
         // conn_host may include port: "example.com:8080" or "[::1]:8080"
-        let (server_name, server_port) = parse_host_port(&self.conn_host);
+        let (server_name, server_port) = parse_host_port(&self.conn_host, &self.conn_scheme);
         meta.set_item("SERVER_NAME", server_name)?;
-        meta.set_item("SERVER_PORT", server_port)?;
+        meta.set_item("SERVER_PORT", server_port.to_string())?;
         meta.set_item("SERVER_PROTOCOL", "HTTP/1.1")?;
 
         // REMOTE_ADDR from Actix's connection_info().realip_remote_addr()
@@ -395,6 +406,7 @@ impl PyRequest {
             "query" => self.query_params.clone_ref(py).into_any(),
             "headers" => self.headers.clone_ref(py).into_any(),
             "cookies" => self.cookies.clone_ref(py).into_any(),
+            "state" => self.state.clone_ref(py).into_any(),
             "auth" | "context" => match &self.context {
                 Some(ctx) => ctx.clone_ref(py).into_any(),
                 None => default.unwrap_or_else(|| py.None()),
@@ -412,12 +424,26 @@ impl PyRequest {
             "query" => Ok(self.query_params.clone_ref(py).into_any()),
             "headers" => Ok(self.headers.clone_ref(py).into_any()),
             "cookies" => Ok(self.cookies.clone_ref(py).into_any()),
+            "state" => Ok(self.state.clone_ref(py).into_any()),
             "context" => Ok(match &self.context {
                 Some(ctx) => ctx.clone_ref(py).into_any(),
                 None => py.None(),
             }),
             _ => Err(pyo3::exceptions::PyKeyError::new_err(key.to_string())),
         }
+    }
+
+    #[pyo3(signature = (key, /, default=None))]
+    fn setdefault<'py>(
+        &self,
+        py: Python<'py>,
+        key: &str,
+        default: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        if key == "state" {
+            return Ok(self.state.clone_ref(py).into_any());
+        }
+        Ok(self.get(py, key, default))
     }
 
     fn __setitem__(&mut self, key: &str, value: Py<PyAny>) -> PyResult<()> {
