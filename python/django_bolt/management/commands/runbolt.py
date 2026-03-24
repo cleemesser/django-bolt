@@ -34,6 +34,7 @@ except ImportError:
 
 _ENV_DEV_WORKER = "DJANGO_BOLT_DEV_WORKER"
 _ENV_DEV_RELOAD_COUNT = "DJANGO_BOLT_DEV_RELOAD_COUNT"
+DEV_RELOAD_DEBOUNCE_MS = 125
 
 DEV_RELOAD_IGNORE_DIRS = (
     ".git",
@@ -336,6 +337,7 @@ class Command(BaseCommand):
             watch_paths,
             list(DEV_RELOAD_IGNORE_DIRS),
             ignore_paths,
+            DEV_RELOAD_DEBOUNCE_MS,
         )
 
         if exit_code:

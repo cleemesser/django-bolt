@@ -4,6 +4,8 @@ import importlib
 import sys
 from types import SimpleNamespace
 
+from django.core.management import execute_from_command_line
+
 from django_bolt.management.commands import runbolt as runbolt_module
 
 
@@ -88,6 +90,54 @@ def test_collect_dev_watch_paths_prefers_project_paths(settings, tmp_path, monke
     assert str(static_root) in watch_paths
     assert str(external_app) in watch_paths
     assert str(venv_app) not in watch_paths
+
+
+def test_execute_from_command_line_dev_calls_reloader_with_debounce(monkeypatch):
+    recorded = {}
+    argv = [
+        "manage.py",
+        "runbolt",
+        "--dev",
+        "--host",
+        "127.0.0.1",
+        "--processes",
+        "4",
+    ]
+
+    def fake_run_dev_reloader(command, watch_paths, ignore_dir_names, ignore_paths, debounce_ms):
+        recorded["command"] = command
+        recorded["watch_paths"] = watch_paths
+        recorded["ignore_dir_names"] = ignore_dir_names
+        recorded["ignore_paths"] = ignore_paths
+        recorded["debounce_ms"] = debounce_ms
+        return 0
+
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(runbolt_module, "_collect_dev_watch_paths", lambda: ["/tmp/project"])
+    monkeypatch.setattr(runbolt_module, "_collect_dev_ignore_paths", lambda: ["/tmp/venv"])
+    monkeypatch.setattr(
+        runbolt_module,
+        "_core",
+        SimpleNamespace(run_dev_reloader=fake_run_dev_reloader),
+    )
+
+    execute_from_command_line(argv)
+
+    assert recorded == {
+        "command": [
+            sys.executable,
+            "manage.py",
+            "runbolt",
+            "--host",
+            "127.0.0.1",
+            "--processes",
+            "1",
+        ],
+        "watch_paths": ["/tmp/project"],
+        "ignore_dir_names": list(runbolt_module.DEV_RELOAD_IGNORE_DIRS),
+        "ignore_paths": ["/tmp/venv"],
+        "debounce_ms": runbolt_module.DEV_RELOAD_DEBOUNCE_MS,
+    }
 
 
 def test_autodiscover_apis_uses_top_level_api_for_plain_root_urlconf(settings, tmp_path, monkeypatch):
