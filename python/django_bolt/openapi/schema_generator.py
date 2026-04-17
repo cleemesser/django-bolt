@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, get_args, get_origin
 
 import msgspec
 
+from ..serializers.fields import _FieldMarker
 from ..typing import is_msgspec_struct, is_optional
 from .spec import (
     OpenAPI,
@@ -91,10 +92,24 @@ class SchemaGenerator:
         """Build a schema and required flag for a msgspec-inspected field."""
         field_name = field.encode_name
         field_schema = self._type_to_schema(field.type, register_component=register_component)
-        field_required = field.required and field.default is msgspec.NODEFAULT
 
-        if field.default is not msgspec.NODEFAULT:
-            field_schema = self._with_default(field_schema, field.default)
+        default = field.default
+        has_default = default is not msgspec.NODEFAULT
+        field_required = field.required
+
+        # Unwrap Serializer field() markers: msgspec stores the _FieldMarker as
+        # the default, so field.required is False even when the marker carries
+        # only config and no real default.
+        if isinstance(default, _FieldMarker):
+            if default.config.has_default():
+                default = default.config.get_default()
+            else:
+                has_default = False
+                field_required = True
+
+        if has_default:
+            field_schema = self._with_default(field_schema, default)
+            field_required = False
 
         return field_name, field_schema, field_required
 

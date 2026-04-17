@@ -143,6 +143,38 @@ def test_openapi_root_path_serves_ui_directly():
         assert "swagger" in html.lower(), "Response should contain Swagger UI"
 
 
+def test_openapi_renders_serializer_with_field_marker_default():
+    """Regression: serializer field() used as default must not leak the
+    internal _FieldMarker (which carries a bare object() sentinel for
+    unset defaults) into the OpenAPI schema's JSON output.
+    """
+    from django_bolt.serializers import Serializer, field
+
+    class AstronautCreated(Serializer):
+        id: int
+        name: str
+        mission: str = field(source="mission.name")
+
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.post("/astronauts", response_model=AstronautCreated)
+    async def create(a: AstronautCreated) -> AstronautCreated:
+        return a
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        response = client.get("/docs")
+        assert response.status_code == 200, response.text
+
+        response = client.get("/docs/openapi.json")
+        assert response.status_code == 200, response.text
+
+        schema = response.json()["components"]["schemas"]["AstronautCreated"]
+        assert "default" not in schema["properties"]["mission"]
+        assert "mission" in schema["required"]
+
+
 def test_openapi_disabled_returns_404():
     """Test that disabled OpenAPI docs return 404."""
     api = BoltAPI(
