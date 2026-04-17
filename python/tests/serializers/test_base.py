@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from django_bolt.exceptions import RequestValidationError
-from django_bolt.serializers import Serializer, field_validator, model_validator
+from django_bolt.serializers import Email, Serializer, field_validator, model_validator
 
 
 class TestSerializerBasics:
@@ -434,3 +434,75 @@ class TestMultiErrorCollection:
         user = UserSerializer(email="valid@example.com", password="longpassword123")
         assert user.email == "valid@example.com"
         assert user.password == "longpassword123"
+
+
+class TestModelValidateCollectsAllErrors:
+    """Regression tests for issue #201 — model_validate/model_validate_json must
+    collect every error, including missing required fields, not just those that
+    happen to be present in the payload."""
+
+    def test_missing_required_field_collected_alongside_invalid_field(self):
+        class Contact(Serializer):
+            first_name: str
+            last_name: str
+            email: Email | None = None
+
+        with pytest.raises(RequestValidationError) as exc_info:
+            Contact.model_validate({"first_name": "Foo", "email": 42})
+
+        errors = exc_info.value.errors()
+        locs = {tuple(err["loc"]) for err in errors}
+        assert ("body", "last_name") in locs, f"expected missing last_name error, got {errors!r}"
+        assert ("body", "email") in locs, f"expected email type error, got {errors!r}"
+
+    def test_missing_required_field_collected_from_json(self):
+        class Contact(Serializer):
+            first_name: str
+            last_name: str
+            email: Email | None = None
+
+        with pytest.raises(RequestValidationError) as exc_info:
+            Contact.model_validate_json(b'{"first_name": "Foo", "email": 42}')
+
+        errors = exc_info.value.errors()
+        locs = {tuple(err["loc"]) for err in errors}
+        assert ("body", "last_name") in locs
+        assert ("body", "email") in locs
+
+    def test_multiple_missing_required_fields_all_reported(self):
+        class Signup(Serializer):
+            username: str
+            password: str
+            age: int
+
+        with pytest.raises(RequestValidationError) as exc_info:
+            Signup.model_validate({"username": "x"})
+
+        errors = exc_info.value.errors()
+        locs = {tuple(err["loc"]) for err in errors}
+        assert ("body", "password") in locs
+        assert ("body", "age") in locs
+        for err in errors:
+            if tuple(err["loc"]) in {("body", "password"), ("body", "age")}:
+                assert err["type"] == "missing"
+
+    def test_optional_missing_field_does_not_produce_error(self):
+        class Profile(Serializer):
+            name: str
+            nickname: str = "anon"
+
+        profile = Profile.model_validate({"name": "alice"})
+        assert profile.name == "alice"
+        assert profile.nickname == "anon"
+
+    def test_renamed_missing_required_field_reports_encoded_key(self):
+        class Payload(Serializer, rename="camel"):
+            first_name: str
+            last_name: str
+
+        with pytest.raises(RequestValidationError) as exc_info:
+            Payload.model_validate({"firstName": "Foo"})
+
+        errors = exc_info.value.errors()
+        locs = {tuple(err["loc"]) for err in errors}
+        assert ("body", "lastName") in locs

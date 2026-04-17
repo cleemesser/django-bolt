@@ -947,12 +947,24 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         errors: list[dict[str, Any]] = []
         annotations = get_type_hints(cls, include_extras=True)
         rename_map = cls.__rename_map__
+        fields = cls.__struct_fields__
+        defaults = cls.__struct_defaults__
+        default_offset = len(fields) - len(defaults)
 
-        for field_name in cls.__struct_fields__:
+        for idx, field_name in enumerate(fields):
             # rename_map.get() works for empty dict too (returns field_name as default)
             data_key = rename_map.get(field_name, field_name)
             if data_key not in data:
-                # Missing field - msgspec will handle this
+                default_idx = idx - default_offset
+                is_required = default_idx < 0 or defaults[default_idx] is msgspec.NODEFAULT
+                if is_required:
+                    errors.append(
+                        {
+                            "loc": ("body", data_key),
+                            "msg": f"Object missing required field `{data_key}`",
+                            "type": "missing",
+                        }
+                    )
                 continue
 
             try:
