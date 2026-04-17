@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.5]
+
+### Added
+
+- **`EventSourceResponse` for Server-Sent Events** - FastAPI-style SSE response type with automatic event framing and reconnection support. (#203)
+- **Class-based views improvements** - `ViewSet`/`ModelViewSet` refinements alongside built-in pagination support for class-based list actions. (#189)
+
+### Fixed
+
+- **`Depends()` targets that read `request.query`/`.headers`/`.cookies`/`.body`** - Registration-time static analysis now recurses into `Depends()` targets (including class-callable backends like `Depends(FilterBackend(...))`), so a dep that accesses request components no longer sees an empty dict. Rust was silently skipping request-component parsing for routes whose handler didn't directly reference `request.*` even though a dep did.
+- **Serializer `model_validate` now reports missing required fields** - Validation errors now include the names of missing required fields instead of a generic message. (#201)
+- **OpenAPI schema unwraps `_FieldMarker` defaults** - Generated OpenAPI schemas no longer leak internal `_FieldMarker` objects as serializer defaults.
+
 ## [0.6.4]
 
 ### Added
