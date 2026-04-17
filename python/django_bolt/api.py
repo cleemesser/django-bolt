@@ -34,7 +34,7 @@ from ._kwargs import (
 from ._view_context import _current_action, _current_request
 from .admin.routes import AdminRouteRegistrar
 from .admin.static_routes import StaticRouteRegistrar
-from .analysis import analyze_handler, warn_blocking_handler
+from .analysis import analyze_dependency_tree, analyze_handler, warn_blocking_handler
 from .auth import get_default_authentication_classes, register_auth_backend
 from .auth.user_loader import load_user_sync
 from .concurrency import sync_to_thread
@@ -1257,6 +1257,23 @@ class BoltAPI:
                     meta["needs_query"] = meta.get("needs_query", False) or handler_analysis.request_needs_query
                     meta["needs_headers"] = meta.get("needs_headers", False) or handler_analysis.request_needs_headers
                     meta["needs_cookies"] = meta.get("needs_cookies", False) or handler_analysis.request_needs_cookies
+
+            # Recursively analyze Depends targets so a dep reading request.query
+            # (etc.) causes the handler's route to actually parse query params.
+            # Populate self._handler_meta by callable so runtime dep resolution
+            # (dependencies.resolve_dependency) reuses the compiled meta too.
+            def _compile_dep(dep_fn: Callable) -> dict[str, Any]:
+                cached = self._handler_meta.get(dep_fn)
+                if cached is not None:
+                    return cached
+                compiled = self._compile_binder(dep_fn, method, full_path)
+                self._handler_meta[dep_fn] = compiled
+                return compiled
+
+            dep_needs = analyze_dependency_tree(meta, _compile_dep)
+            for needs_key in ("needs_body", "needs_query", "needs_headers", "needs_cookies"):
+                if getattr(dep_needs, needs_key):
+                    meta[needs_key] = True
 
             meta["is_blocking"] = handler_analysis.is_blocking
 

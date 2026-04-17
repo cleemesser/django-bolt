@@ -20,9 +20,46 @@ from dataclasses import dataclass, field
 from typing import Any
 
 __all__ = [
+    "DependencyNeeds",
     "HandlerAnalysis",
+    "analyze_dependency_tree",
     "analyze_handler",
+    "resolve_introspection_target",
 ]
+
+
+def resolve_introspection_target(fn: Any) -> Any:
+    """Return a form of ``fn`` that ``inspect.getsource`` / ``get_type_hints`` can handle.
+
+    Class-callable instances (``Depends(Backend(...))``) are routed to their
+    ``__call__`` method so downstream introspection works.
+    """
+    if inspect.isfunction(fn) or inspect.ismethod(fn) or inspect.isclass(fn) or inspect.ismodule(fn):
+        return fn
+    call = inspect.getattr_static(type(fn), "__call__", None)
+    if call is None or call is object.__call__:
+        return fn
+    return call
+
+
+@dataclass
+class DependencyNeeds:
+    """Request-component needs aggregated across a handler's Depends() tree."""
+
+    needs_body: bool = False
+    needs_query: bool = False
+    needs_headers: bool = False
+    needs_cookies: bool = False
+
+    @property
+    def saturated(self) -> bool:
+        return self.needs_body and self.needs_query and self.needs_headers and self.needs_cookies
+
+    def set_all(self) -> None:
+        self.needs_body = True
+        self.needs_query = True
+        self.needs_headers = True
+        self.needs_cookies = True
 
 
 # Django ORM manager attributes
@@ -435,7 +472,8 @@ def analyze_handler(
     """
     analysis = HandlerAnalysis()
 
-    unwraped_source = inspect.unwrap(fn)
+    unwraped_source = inspect.unwrap(resolve_introspection_target(inspect.unwrap(fn)))
+
     # Try to get source code
     try:
         source = inspect.getsource(unwraped_source)
@@ -468,6 +506,96 @@ def analyze_handler(
             break  # Only analyze the first function found
 
     return visitor.analysis
+
+
+_REQUEST_PARAM_NAMES = frozenset({"request", "req"})
+
+
+def _dep_request_param_names(dep_meta: dict[str, Any]) -> set[str]:
+    """Return the set of parameter names that receive the raw request object."""
+    if dep_meta.get("mode") == "request_only":
+        sig = dep_meta.get("sig")
+        if sig is None:
+            return set()
+        return {p.name for p in sig.parameters.values() if p.name in _REQUEST_PARAM_NAMES}
+    fields = dep_meta.get("fields", [])
+    return {f.name for f in fields if f.source == "request"}
+
+
+def analyze_dependency_tree(
+    meta: dict[str, Any],
+    compile_dep_fn: Callable[[Callable[..., Any]], dict[str, Any]],
+) -> DependencyNeeds:
+    """Recursively analyze a handler's Depends targets for request-component access.
+
+    Walks every field in ``meta["fields"]`` that is a Depends-backed field,
+    compiles its own parameter binder (via ``compile_dep_fn``), and aggregates
+    the request components (body/query/headers/cookies) that any dep reads —
+    either through a typed parameter (Query/Header/Cookie/Body/Form/File) or by
+    touching ``request.query`` / ``request.headers`` / ``request.body`` /
+    ``request.cookies`` inside its body.
+
+    Without this, static AST analysis would stop at the handler boundary,
+    causing Rust to skip request-component parsing even though a dep needs it.
+
+    Args:
+        meta: Handler metadata (must have ``fields`` list already populated).
+        compile_dep_fn: Callable that returns a dep's compiled HandlerMetadata.
+            Responsible for caching so repeated deps aren't recompiled.
+
+    Returns:
+        DependencyNeeds aggregated across the whole dep subtree.
+    """
+    result = DependencyNeeds()
+    _walk_dep_tree(meta, compile_dep_fn, result, visited=set())
+    return result
+
+
+def _walk_dep_tree(
+    meta: dict[str, Any],
+    compile_dep_fn: Callable[[Callable[..., Any]], dict[str, Any]],
+    acc: DependencyNeeds,
+    visited: set[int],
+) -> None:
+    for dep_field in meta.get("fields", []):
+        if acc.saturated:
+            return
+        if dep_field.source != "dependency":
+            continue
+        marker = dep_field.dependency
+        dep_fn = marker.dependency if marker is not None else None
+        if dep_fn is None:
+            continue
+
+        dep_id = id(dep_fn)
+        if dep_id in visited:
+            continue
+        visited.add(dep_id)
+
+        try:
+            dep_meta = compile_dep_fn(dep_fn)
+        except Exception:
+            # Unknown introspection failure — assume the dep needs every component.
+            acc.set_all()
+            return
+
+        acc.needs_body |= bool(dep_meta.get("needs_body", False))
+        acc.needs_query |= bool(dep_meta.get("needs_query", False))
+        acc.needs_headers |= bool(dep_meta.get("needs_headers", False))
+        acc.needs_cookies |= bool(dep_meta.get("needs_cookies", False))
+
+        dep_request_names = _dep_request_param_names(dep_meta)
+        if dep_request_names:
+            dep_analysis = analyze_handler(dep_fn, request_param_names=dep_request_names)
+            if dep_analysis.analysis_failed:
+                acc.set_all()
+                return
+            acc.needs_body |= dep_analysis.request_needs_body
+            acc.needs_query |= dep_analysis.request_needs_query
+            acc.needs_headers |= dep_analysis.request_needs_headers
+            acc.needs_cookies |= dep_analysis.request_needs_cookies
+
+        _walk_dep_tree(dep_meta, compile_dep_fn, acc, visited)
 
 
 def warn_blocking_handler(

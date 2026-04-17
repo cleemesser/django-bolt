@@ -12,7 +12,9 @@ from __future__ import annotations
 import warnings
 
 from django_bolt.analysis import (
+    DependencyNeeds,
     HandlerAnalysis,
+    analyze_dependency_tree,
     analyze_handler,
     warn_blocking_handler,
 )
@@ -460,3 +462,203 @@ class TestHandlerAnalysisProperties:
         """Test is_blocking returns False when neither present."""
         analysis = HandlerAnalysis()
         assert analysis.is_blocking is False
+
+
+# --- Support fixtures for dependency-tree analysis tests ---
+
+
+def _dep_reads_query_via_request(request):
+    return dict(request.query)
+
+
+def _dep_reads_headers_via_request(request):
+    return dict(request.headers)
+
+
+def _dep_reads_cookies_via_request(request):
+    return dict(request.cookies)
+
+
+def _dep_reads_body_via_request(request):
+    return request.body
+
+
+def _dep_no_request_access(request):
+    return {"hello": "world"}
+
+
+class _CallableDepReadsQuery:
+    def __call__(self, request):
+        return dict(request.query)
+
+
+class TestAnalyzeHandlerClassCallable:
+    """analyze_handler must resolve class-callable instances to their __call__."""
+
+    def test_class_callable_query_detection(self):
+        instance = _CallableDepReadsQuery()
+        analysis = analyze_handler(instance, request_param_names={"request"})
+        assert analysis.analysis_failed is False
+        assert analysis.request_needs_query is True
+
+
+def _make_fake_field(*, source, dep_fn=None, name="dep"):
+    """Build a minimal object with the attributes analyze_dependency_tree reads."""
+
+    class FakeDependsMarker:
+        def __init__(self, dependency):
+            self.dependency = dependency
+
+    class FakeField:
+        pass
+
+    f = FakeField()
+    f.name = name
+    f.source = source
+    f.dependency = FakeDependsMarker(dep_fn) if dep_fn is not None else None
+    return f
+
+
+class TestAnalyzeDependencyTree:
+    """analyze_dependency_tree walks Depends targets and aggregates needs."""
+
+    def _compile_fn(self, fake_metas):
+        """Return a compile_dep_fn that looks up pre-built metas by callable."""
+
+        def compiler(fn):
+            return fake_metas[fn]
+
+        return compiler
+
+    def test_no_dep_fields_produces_no_needs(self):
+        meta = {"fields": []}
+        needs = analyze_dependency_tree(meta, lambda fn: {})
+        assert needs == DependencyNeeds()
+
+    def test_dep_reading_request_query_marks_query(self):
+        import inspect  # noqa: PLC0415
+
+        dep_fn = _dep_reads_query_via_request
+        dep_meta = {
+            "mode": "request_only",
+            "sig": inspect.signature(dep_fn),
+            "fields": [],
+        }
+        handler_meta = {"fields": [_make_fake_field(source="dependency", dep_fn=dep_fn)]}
+
+        needs = analyze_dependency_tree(handler_meta, self._compile_fn({dep_fn: dep_meta}))
+
+        assert needs.needs_query is True
+        assert needs.needs_headers is False
+        assert needs.needs_cookies is False
+        assert needs.needs_body is False
+
+    def test_dep_reading_request_headers_marks_headers(self):
+        import inspect  # noqa: PLC0415
+
+        dep_fn = _dep_reads_headers_via_request
+        dep_meta = {
+            "mode": "request_only",
+            "sig": inspect.signature(dep_fn),
+            "fields": [],
+        }
+        handler_meta = {"fields": [_make_fake_field(source="dependency", dep_fn=dep_fn)]}
+
+        needs = analyze_dependency_tree(handler_meta, self._compile_fn({dep_fn: dep_meta}))
+
+        assert needs.needs_headers is True
+        assert needs.needs_query is False
+
+    def test_dep_reading_request_cookies_marks_cookies(self):
+        import inspect  # noqa: PLC0415
+
+        dep_fn = _dep_reads_cookies_via_request
+        dep_meta = {
+            "mode": "request_only",
+            "sig": inspect.signature(dep_fn),
+            "fields": [],
+        }
+        handler_meta = {"fields": [_make_fake_field(source="dependency", dep_fn=dep_fn)]}
+
+        needs = analyze_dependency_tree(handler_meta, self._compile_fn({dep_fn: dep_meta}))
+
+        assert needs.needs_cookies is True
+
+    def test_dep_reading_request_body_marks_body(self):
+        import inspect  # noqa: PLC0415
+
+        dep_fn = _dep_reads_body_via_request
+        dep_meta = {
+            "mode": "request_only",
+            "sig": inspect.signature(dep_fn),
+            "fields": [],
+        }
+        handler_meta = {"fields": [_make_fake_field(source="dependency", dep_fn=dep_fn)]}
+
+        needs = analyze_dependency_tree(handler_meta, self._compile_fn({dep_fn: dep_meta}))
+
+        assert needs.needs_body is True
+
+    def test_dep_without_request_access_produces_no_needs(self):
+        import inspect  # noqa: PLC0415
+
+        dep_fn = _dep_no_request_access
+        dep_meta = {
+            "mode": "request_only",
+            "sig": inspect.signature(dep_fn),
+            "fields": [],
+        }
+        handler_meta = {"fields": [_make_fake_field(source="dependency", dep_fn=dep_fn)]}
+
+        needs = analyze_dependency_tree(handler_meta, self._compile_fn({dep_fn: dep_meta}))
+
+        assert needs == DependencyNeeds()
+
+    def test_typed_query_in_dep_is_picked_up_via_needs_query(self):
+        """A dep with a typed Query() param already sets needs_query in its meta."""
+        dep_fn = lambda page: {"page": page}  # noqa: E731
+        dep_meta = {
+            "mode": "mixed",
+            "fields": [],
+            "needs_query": True,
+        }
+        handler_meta = {"fields": [_make_fake_field(source="dependency", dep_fn=dep_fn)]}
+
+        needs = analyze_dependency_tree(handler_meta, self._compile_fn({dep_fn: dep_meta}))
+
+        assert needs.needs_query is True
+
+    def test_compile_failure_marks_all_needs(self):
+        """If the dep cannot be compiled, we must fall back to parsing everything."""
+        dep_fn = _dep_reads_query_via_request
+        handler_meta = {"fields": [_make_fake_field(source="dependency", dep_fn=dep_fn)]}
+
+        def failing_compiler(fn):
+            raise TypeError("cannot introspect")
+
+        needs = analyze_dependency_tree(handler_meta, failing_compiler)
+
+        assert needs.needs_body is True
+        assert needs.needs_query is True
+        assert needs.needs_headers is True
+        assert needs.needs_cookies is True
+
+    def test_visited_set_prevents_infinite_recursion_on_self_reference(self):
+        """A dep referenced twice is only analyzed once (by identity)."""
+        import inspect  # noqa: PLC0415
+
+        dep_fn = _dep_reads_query_via_request
+        dep_meta = {
+            "mode": "request_only",
+            "sig": inspect.signature(dep_fn),
+            "fields": [],
+        }
+        handler_meta = {
+            "fields": [
+                _make_fake_field(source="dependency", dep_fn=dep_fn, name="a"),
+                _make_fake_field(source="dependency", dep_fn=dep_fn, name="b"),
+            ]
+        }
+
+        needs = analyze_dependency_tree(handler_meta, self._compile_fn({dep_fn: dep_meta}))
+        assert needs.needs_query is True

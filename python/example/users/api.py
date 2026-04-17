@@ -12,6 +12,7 @@ from django_bolt.pagination import (
     PageNumberPagination,
     paginate,
 )
+from django_bolt.params import Depends
 from django_bolt.serializers import Serializer
 from django_bolt.views import APIView, ModelViewSet, ViewSet
 
@@ -453,3 +454,52 @@ class UserModelPaginatedViewSet(ModelViewSet):
     # list(), retrieve(), create(), update(), partial_update(), destroy()
     # are all automatically implemented by ModelViewSet
     # Pagination is automatically applied to list() action
+
+
+# ============================================================================
+# Filter Backend via Depends (class-callable dep reading request.query)
+# ============================================================================
+#
+# Demonstrates that a Depends() target can read request.query directly even
+# when the handler itself never references `request`. Static analysis at
+# registration walks the dep tree, so Rust still parses the query string.
+#
+# Try:
+#   GET /users/filtered
+#   GET /users/filtered?is_active=false
+#   GET /users/filtered?is_active=true&username=user1
+
+
+class QueryFilterBackend:
+    """Minimal filter backend: whitelists query params and applies them as
+    exact-match `filter(**kwargs)` on the queryset.
+    """
+
+    def __init__(self, fields: tuple[str, ...]) -> None:
+        self.fields = fields
+
+    def __call__(self, request) -> dict:
+        raw = request.query
+        filters: dict = {}
+        for name in self.fields:
+            if name not in raw:
+                continue
+            value = raw[name]
+            lowered = value.lower()
+            if lowered == "true":
+                value = True
+            elif lowered == "false":
+                value = False
+            filters[name] = value
+        return filters
+
+
+@api.get("/filtered")
+async def list_users_filtered(
+    filters: Annotated[
+        dict,
+        Depends(QueryFilterBackend(fields=("username", "is_active", "email"))),
+    ],
+) -> list[UserMini]:
+    """List users with filters derived from ?username=... &is_active=... &email=..."""
+    return User.objects.filter(**filters).only("id", "username")[:20]

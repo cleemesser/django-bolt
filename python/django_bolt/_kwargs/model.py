@@ -15,6 +15,7 @@ from typing import Annotated, Any, get_args, get_origin, get_type_hints
 
 import msgspec
 
+from ..analysis import resolve_introspection_target
 from ..dependencies import resolve_dependency
 from ..params import Depends as DependsMarker
 from ..params import Param
@@ -156,7 +157,8 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
     # Use fn.__module__ to get the module where annotations were defined (especially important for
     # class-based views where the handler wrapper is created in views.py but annotations come from user's module)
     globalns = sys.modules.get(fn.__module__, {}).__dict__ if fn.__module__ else {}
-    type_hints = get_type_hints(fn, globalns=globalns, include_extras=True)
+    # Class-callable deps (Depends(Backend(...))) expose __call__ — route get_type_hints through it.
+    type_hints = get_type_hints(resolve_introspection_target(fn), globalns=globalns, include_extras=True)
 
     # Extract path parameters from route pattern
     path_params = extract_path_params(path)
