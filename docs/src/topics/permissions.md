@@ -6,6 +6,10 @@ icon: lucide/shield-check
 
 Django-Bolt uses "guards" to control access to endpoints. Guards are permission checks that run in Rust after authentication but before your handler is called.
 
+!!! warning "Guards enforce, `auth` doesn't"
+
+    `auth=[...]` only *attempts* authentication — it never rejects a request on its own. Enforcement (401/403) is the job of guards. An endpoint declared with just `auth=[JWTAuthentication()]` and no guards will happily serve requests with missing or invalid tokens, and `request.context` will be `None`. Always pair `auth` with at least `guards=[IsAuthenticated()]` when you want to require login. See [Authentication](authentication.md#jwt-authentication) for details.
+
 ## Built-in guards
 
 ### IsAuthenticated

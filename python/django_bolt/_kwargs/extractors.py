@@ -213,14 +213,19 @@ def create_form_extractor(name: str, annotation: Any, default: Any, alias: str |
 
 
 def _upload_file_dec_hook(typ: type, obj: Any) -> Any:
-    """dec_hook for msgspec.convert() that handles UploadFile construction.
+    """dec_hook for msgspec.convert() that builds UploadFile from Rust file_info dicts.
 
-    When msgspec encounters an UploadFile field, it calls this hook to convert
-    the raw file_info dict (from Rust form parsing) into an UploadFile instance.
+    Non-dict inputs (e.g. a plain text form value sent under a file field)
+    must raise msgspec.ValidationError so _collect_struct_errors can surface
+    them as a structured 422 instead of crashing in from_file_info.
     """
     if isinstance(obj, typ):
         return obj
     if typ is UploadFile:
+        if not isinstance(obj, dict):
+            raise msgspec.ValidationError(
+                f"Expected uploaded file, got {type(obj).__name__}"
+            )
         return UploadFile.from_file_info(obj)
     raise NotImplementedError(f"Unsupported type: {typ}")
 

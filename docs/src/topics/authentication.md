@@ -30,6 +30,28 @@ This endpoint:
 3. Rejects the request with 401 if the token is invalid
 4. Populates `request.context` with token claims
 
+!!! warning "`auth` attempts, `guards` enforce"
+
+    `auth=[...]` alone does **not** reject unauthenticated requests — it only *attempts* to validate credentials. If the token is missing, expired, or has an invalid signature, the handler still runs with `request.context = None` and `request.user = AnonymousUser`. This is intentional so that endpoints can support optional authentication (e.g. personalize if logged in, otherwise public).
+
+    To require a valid token, pair `auth` with a guard like `guards=[IsAuthenticated()]`. Without it, invalid credentials fall through silently.
+
+    ```python
+    # ❌ NOT protected — invalid/missing tokens still reach the handler
+    @api.get("/profile", auth=[JWTAuthentication()])
+    async def profile(request):
+        print(request.context)  # None when token is invalid/missing
+        print(request.user)     # AnonymousUser
+
+    # ✅ Protected — returns 401 when token is invalid/missing
+    @api.get("/profile", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
+    async def profile(request):
+        print(request.context)  # {"user_id": ..., "auth_backend": "jwt", ...}
+        print(request.user)     # real User instance (lazy-loaded)
+    ```
+
+    See [Permissions](permissions.md) for the full list of guards.
+
 ### Creating tokens for users
 
 Use `create_jwt_for_user` to generate tokens for Django users:

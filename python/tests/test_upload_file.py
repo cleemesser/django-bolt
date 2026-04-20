@@ -37,6 +37,23 @@ class ProfileFormOptional(msgspec.Struct):
     avatar: UploadFile | None = None
 
 
+class ProfileFormAnnotated(msgspec.Struct):
+    """Struct whose file field keeps Annotated metadata visible to msgspec."""
+
+    name: str
+    avatar: Annotated[UploadFile, File(max_size=1_000_000, allowed_types=["image/*"])]
+
+
+class ProfileFormAnnotatedOptional(msgspec.Struct):
+    name: str
+    avatar: Annotated[UploadFile | None, File(max_size=1_000_000)] = None
+
+
+class DocumentFormAnnotated(msgspec.Struct):
+    title: str
+    documents: Annotated[list[UploadFile], File(max_files=5)]
+
+
 class TestUploadFileClass:
     """Test basic UploadFile class functionality."""
 
@@ -560,6 +577,103 @@ class TestFormStructWithUploadFile:
         assert errors[0]["type"] == "file_missing"
         assert errors[0]["loc"] == ["body", "avatar"]
         assert "Missing required file" in errors[0]["msg"]
+
+    def test_struct_with_annotated_upload_file(self):
+        """Annotated[UploadFile, File(...)] inside a struct must be parsed as a file."""
+        api = BoltAPI()
+
+        @api.post("/profile")
+        async def update_profile(data: Annotated[ProfileFormAnnotated, Form()]):
+            content = await data.avatar.read()
+            return {
+                "name": data.name,
+                "avatar_filename": data.avatar.filename,
+                "avatar_size": len(content),
+                "is_upload": isinstance(data.avatar, UploadFileClass),
+            }
+
+        client = TestClient(api)
+        response = client.post(
+            "/profile",
+            data={"name": "Jane"},
+            files={"avatar": ("photo.png", b"image bytes", "image/png")},
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["name"] == "Jane"
+        assert body["avatar_filename"] == "photo.png"
+        assert body["avatar_size"] == len(b"image bytes")
+        assert body["is_upload"] is True
+
+    def test_struct_with_annotated_optional_upload_file(self):
+        """Annotated[UploadFile | None, File(...)] must still deserialize when provided."""
+        api = BoltAPI()
+
+        @api.post("/profile")
+        async def update_profile(data: Annotated[ProfileFormAnnotatedOptional, Form()]):
+            return {
+                "name": data.name,
+                "has_avatar": data.avatar is not None,
+                "avatar_filename": data.avatar.filename if data.avatar else None,
+            }
+
+        client = TestClient(api)
+        response = client.post(
+            "/profile",
+            data={"name": "Jane"},
+            files={"avatar": ("photo.png", b"x", "image/png")},
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["has_avatar"] is True
+        assert body["avatar_filename"] == "photo.png"
+
+    def test_struct_with_annotated_list_upload_file(self):
+        """Annotated[list[UploadFile], File(...)] inside a struct must collect all files."""
+        api = BoltAPI()
+
+        @api.post("/documents")
+        async def upload_documents(data: Annotated[DocumentFormAnnotated, Form()]):
+            return {
+                "title": data.title,
+                "count": len(data.documents),
+                "filenames": sorted(d.filename for d in data.documents),
+            }
+
+        client = TestClient(api)
+        response = client.post(
+            "/documents",
+            data={"title": "Docs"},
+            files=[
+                ("documents", ("a.pdf", b"a", "application/pdf")),
+                ("documents", ("b.pdf", b"b", "application/pdf")),
+            ],
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["count"] == 2
+        assert body["filenames"] == ["a.pdf", "b.pdf"]
+
+    def test_struct_file_field_sent_as_text_returns_422(self):
+        """A file field sent as a plain text form value must return 422, not crash."""
+        api = BoltAPI()
+
+        @api.post("/profile")
+        async def update_profile(data: Annotated[ProfileFormAnnotated, Form()]):
+            return {"name": data.name}
+
+        client = TestClient(api)
+        response = client.post(
+            "/profile",
+            data={"name": "Jane", "avatar": "not-a-file.pdf"},
+        )
+
+        assert response.status_code == 422, response.text
+        errors = response.json()["detail"]
+        assert any(err["loc"][-1] == "avatar" for err in errors)
 
 
 class TestBackwardCompatibility:

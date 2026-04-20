@@ -14,7 +14,7 @@ from dataclasses import dataclass, is_dataclass
 from enum import Enum
 from functools import reduce
 from operator import or_
-from typing import TYPE_CHECKING, Any, TypedDict, Union, get_args, get_origin
+from typing import TYPE_CHECKING, Annotated, Any, TypedDict, Union, get_args, get_origin
 
 import msgspec
 
@@ -262,30 +262,21 @@ def is_optional(annotation: Any) -> bool:
 
 
 def is_upload_file_type(annotation: Any) -> bool:
+    """Return True if annotation resolves to UploadFile or list[UploadFile].
+
+    Recurses through Annotated/Optional/list wrappers so struct field detection
+    works for annotations like ``Annotated[UploadFile, File(...)]``.
     """
-    Check if annotation is UploadFile or list[UploadFile].
-
-    Used to detect file upload fields in Form() structs.
-
-    Args:
-        annotation: Type annotation to check
-
-    Returns:
-        True if annotation is UploadFile or list[UploadFile]
-    """
-    # Unwrap Optional first
     unwrapped = unwrap_optional(annotation)
 
-    # Direct UploadFile check using type identity
     if unwrapped is UploadFile:
         return True
 
-    # list[UploadFile]
     origin = get_origin(unwrapped)
-    if origin is list:
+    if origin is list or origin is Annotated:
         args = get_args(unwrapped)
-        if args and args[0] is UploadFile:
-            return True
+        if args:
+            return is_upload_file_type(args[0])
 
     return False
 
