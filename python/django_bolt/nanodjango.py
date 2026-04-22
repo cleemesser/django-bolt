@@ -19,13 +19,10 @@ Run with: python myapp.py runbolt --port 8001
 Install: pip install "django-bolt[nanodjango]"
 """
 
-from __future__ import annotations
-
 import ast
 import inspect
 import sys
 from typing import Any
-
 
 from nanodjango import Django, defer, hookimpl
 from nanodjango.convert.converter import Converter, Resolver
@@ -69,12 +66,10 @@ class BoltAPI(_RealBoltAPI):
         super().__init__(**kwargs)
 
         # Add django_bolt to INSTALLED_APPS immediately on instantiation
-        from django.conf import settings # noqa: 402
+        from django.conf import settings  # noqa: PLC0415
 
         if "django_bolt" not in settings.INSTALLED_APPS:
-            settings.INSTALLED_APPS = list(settings.INSTALLED_APPS) + [
-                "django_bolt"
-            ]
+            settings.INSTALLED_APPS = list(settings.INSTALLED_APPS) + ["django_bolt"]
 
     def _configure_bolt_api(self) -> None:
         """
@@ -87,7 +82,7 @@ class BoltAPI(_RealBoltAPI):
         if self._bolt_api_configured:
             return
 
-        from django.conf import settings # noqa: 402
+        from django.conf import settings  # noqa: PLC0415
 
         module = sys.modules.get(self._module_name)
         if module is None:
@@ -151,7 +146,7 @@ def django_pre_setup(app: Django) -> None:
     is never instantiated (e.g. the app only uses runbolt management command
     without registering routes via this wrapper).
     """
-    from django.conf import settings # noqa: 402
+    from django.conf import settings  # noqa: PLC0415
 
     if not defer.is_installed("django_bolt"):
         return
@@ -161,19 +156,14 @@ def django_pre_setup(app: Django) -> None:
 
 
 @hookimpl
-def convert_build_settings(
-    converter: Converter, resolver: Resolver, settings_ast: ast.AST
-) -> None:
+def convert_build_settings(converter: Converter, resolver: Resolver, settings_ast: ast.AST) -> None:
     """
     Add ``django_bolt`` to INSTALLED_APPS in the generated settings.py.
     """
     for node in settings_ast.body:
         if (
             isinstance(node, ast.Assign)
-            and any(
-                isinstance(t, ast.Name) and t.id == "INSTALLED_APPS"
-                for t in node.targets
-            )
+            and any(isinstance(t, ast.Name) and t.id == "INSTALLED_APPS" for t in node.targets)
             and isinstance(node.value, ast.List)
         ):
             node.value.elts.append(ast.Constant(value="django_bolt"))
@@ -181,9 +171,7 @@ def convert_build_settings(
 
 
 @hookimpl
-def convert_build_app_api(
-    converter: Converter, resolver: Resolver, extra_src: list[str]
-) -> tuple[Resolver, list[str]]:
+def convert_build_app_api(converter: Converter, resolver: Resolver, extra_src: list[str]) -> tuple[Resolver, list[str]]:
     """
     During ``nanodjango convert``, move BoltAPI instances and their route
     handlers into ``app/api.py``.
