@@ -933,6 +933,15 @@ async def sse_new_explicit():
     return EventSourceResponse(gen())
 
 
+@api.get("/sse/brotli-demo")
+async def brotli_demo():
+    async def gen():
+        for i in range(20):
+            yield {"i": i, "msg": "x" * 200}
+
+    return EventSourceResponse(gen(), compress="br")
+
+
 # ==== OpenAI-style Chat Completions (streaming/non-streaming) ====
 class ChatMessage(msgspec.Struct):
     role: str

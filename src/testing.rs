@@ -1079,7 +1079,8 @@ async fn handle_test_request_internal(
         }
     };
 
-    match response_from_wire_result(result_obj, skip_compression, skip_cors, is_head_request).await
+    match response_from_wire_result(result_obj, skip_compression, skip_cors, is_head_request, &req)
+        .await
     {
         Ok(response) => response,
         Err(e) => Python::attach(|py| {

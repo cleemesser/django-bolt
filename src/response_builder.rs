@@ -9,13 +9,17 @@ use actix_web::{http::StatusCode, HttpResponse, HttpResponseBuilder};
 use crate::cookies::format_cookie;
 use crate::response_meta::ResponseMeta;
 
-/// Build a streaming response with SSE headers
-/// Pre-bundles common SSE headers to avoid multiple mutations
+/// Build a streaming response with SSE headers.
+/// Pre-bundles common SSE headers to avoid multiple mutations.
+///
+/// When `brotli_compression` is `Some`, sets `Content-Encoding: br` and
+/// `Vary: Accept-Encoding`. When `None`, sets `Content-Encoding: identity`
+/// (the historical SSE behavior — middleware skips compression).
 #[inline]
 pub fn build_sse_response(
     status: StatusCode,
     custom_headers: Vec<(String, String)>,
-    _skip_compression: bool,
+    brotli_compression: Option<&crate::streaming_compression::StreamBrotliConfig>,
 ) -> HttpResponseBuilder {
     let mut builder = HttpResponse::build(status);
 
@@ -32,9 +36,16 @@ pub fn build_sse_response(
     builder.insert_header(("Pragma", "no-cache"));
     builder.insert_header(("Expires", "0"));
 
-    // Always skip compression for SSE — buffering defeats streaming.
-    // The compression middleware checks for Content-Encoding: identity and skips.
-    builder.insert_header(("Content-Encoding", "identity"));
+    match brotli_compression {
+        None => {
+            // Skip the global compression middleware via the identity marker.
+            builder.insert_header(("Content-Encoding", "identity"));
+        }
+        Some(_) => {
+            builder.insert_header(("Content-Encoding", "br"));
+            builder.insert_header(("Vary", "Accept-Encoding"));
+        }
+    }
 
     builder
 }

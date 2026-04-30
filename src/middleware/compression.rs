@@ -79,26 +79,36 @@ where
         Box::pin(async move {
             let res = fut.await?;
 
-            // Check if Content-Encoding is set to "identity"
-            let has_identity = res
+            // If the response already declares a Content-Encoding, the handler
+            // owns the encoding (e.g. per-event brotli SSE). Pass it through
+            // without re-compressing.
+            //
+            // Special case: `identity` is our internal "skip compression"
+            // marker — we strip it before sending so clients don't see it.
+            // Any other value (br, gzip, zstd, etc.) is preserved as-is.
+            let pre_set_encoding = res
                 .headers()
                 .get(CONTENT_ENCODING)
                 .and_then(|v| v.to_str().ok())
-                .map(|v| v.eq_ignore_ascii_case("identity"))
-                .unwrap_or(false);
+                .map(|v| v.to_ascii_lowercase());
 
-            if has_identity {
-                // Remove the Content-Encoding: identity marker and return uncompressed
+            if let Some(encoding) = pre_set_encoding {
                 let (req, mut response) = res.into_parts();
-                response.headers_mut().remove(CONTENT_ENCODING);
-                // Return with identity encoding (no compression)
-                Ok(ServiceResponse::new(
+                if encoding == "identity" {
+                    response.headers_mut().remove(CONTENT_ENCODING);
+                }
+                // For any pre-set encoding (identity or otherwise), pass the
+                // body through with ContentEncoding::Identity so actix doesn't
+                // wrap it in another encoder.
+                return Ok(ServiceResponse::new(
                     req,
                     response.map_body(|head, body| {
                         Encoder::response(ContentEncoding::Identity, head, body)
                     }),
-                ))
-            } else {
+                ));
+            }
+
+            {
                 // Apply compression based on CompressionConfig and Accept-Encoding
                 let (req, mut response) = res.into_parts();
 
@@ -145,6 +155,60 @@ where
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod bypass_tests {
+    use super::*;
+    use actix_web::http::header::{HeaderName, HeaderValue};
+    use actix_web::test::{self, TestRequest};
+    use actix_web::{web, App, HttpResponse};
+
+    #[actix_web::test]
+    async fn pre_set_brotli_encoding_is_preserved_and_not_double_compressed() {
+        // The body must be >= minimum_size (default 500 bytes) to trigger the
+        // compression path in the middleware. With a short body the middleware
+        // skips compression regardless, which would hide the bug we are testing.
+        let large_body: Vec<u8> = b"already-compressed-bytes-".iter().cycle().take(600).cloned().collect();
+        let large_body_clone = large_body.clone();
+
+        let app = test::init_service(
+            App::new().wrap(CompressionMiddleware::new()).route(
+                "/",
+                web::get().to(move || {
+                    let body = large_body_clone.clone();
+                    async move {
+                        HttpResponse::Ok()
+                            .insert_header((
+                                HeaderName::from_static("content-encoding"),
+                                HeaderValue::from_static("br"),
+                            ))
+                            .body(body)
+                    }
+                }),
+            ),
+        )
+        .await;
+
+        let req = TestRequest::get()
+            .uri("/")
+            .insert_header(("accept-encoding", "br, gzip"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+
+        let ce = resp
+            .headers()
+            .get("content-encoding")
+            .map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(ce, Some("br".to_string()));
+
+        // Body must be passed through unchanged; the middleware must NOT
+        // wrap it in another encoder.
+        let body = test::read_body(resp).await;
+        assert_eq!(body.as_ref(), large_body.as_slice());
     }
 }
 

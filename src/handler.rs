@@ -381,6 +381,11 @@ enum ResponseWireBody {
         content_obj: Py<PyAny>,
         is_async_generator: bool,
         ping_interval: Option<f64>,
+        /// Per-chunk brotli config, taken from `StreamingResponse.compress`
+        /// (and `.brotli_quality` / `.brotli_lgwin`) at parse time. `None`
+        /// means no Python-side compression was requested. Negotiation
+        /// against `Accept-Encoding` happens later in the response builder.
+        brotli_cfg: Option<crate::streaming_compression::StreamBrotliConfig>,
     },
 }
 
@@ -478,11 +483,18 @@ fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<Parse
                 None
             };
 
+            // Brotli stream-compression config now lives on the Python
+            // response object (`compress` / `brotli_quality` / `brotli_lgwin`)
+            // instead of a synthetic header.
+            let brotli_cfg =
+                crate::streaming_compression::extract_brotli_config_from_response(&payload);
+
             ResponseWireBody::Stream {
                 media_type,
                 content_obj,
                 is_async_generator,
                 ping_interval,
+                brotli_cfg,
             }
         }
         2 => ResponseWireBody::FilePath(payload.extract::<String>()?), // file
@@ -495,6 +507,36 @@ fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<Parse
     };
 
     Ok(ParsedResponseWire { status, meta, body })
+}
+
+/// Returns true if the request's `Accept-Encoding` header explicitly accepts
+/// brotli. Treats `*` as accepting br, but NOT `br;q=0`.
+fn accepts_brotli(req: &actix_web::HttpRequest) -> bool {
+    let header = match req.headers().get(actix_web::http::header::ACCEPT_ENCODING) {
+        Some(h) => h,
+        None => return false,
+    };
+    let value = match header.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    for entry in value.split(',') {
+        let entry = entry.trim();
+        let mut pieces = entry.split(';');
+        let name = pieces.next().unwrap_or("").trim().to_ascii_lowercase();
+        let mut q: f32 = 1.0;
+        for piece in pieces {
+            if let Some(rest) = piece.trim().strip_prefix("q=") {
+                if let Ok(parsed) = rest.parse::<f32>() {
+                    q = parsed;
+                }
+            }
+        }
+        if (name == "br" || name == "*") && q > 0.0 {
+            return true;
+        }
+    }
+    false
 }
 
 #[inline]
@@ -513,6 +555,7 @@ async fn build_response_from_parsed(
     skip_compression: bool,
     skip_cors: bool,
     is_head_request: bool,
+    req: &HttpRequest,
 ) -> HttpResponse {
     let meta_ref = parsed.meta.as_ref();
 
@@ -566,43 +609,64 @@ async fn build_response_from_parsed(
             content_obj,
             is_async_generator,
             ping_interval,
+            brotli_cfg,
         } => {
             let headers = response_builder::meta_to_headers(meta_ref);
+
+            // Negotiation: only honor compression if the client accepts it.
+            let active_brotli = match brotli_cfg {
+                Some(cfg) if accepts_brotli(req) => Some(cfg),
+                _ => None,
+            };
+
             if media_type == "text/event-stream" {
                 if is_head_request {
                     let mut response = response_builder::build_sse_response(
                         parsed.status,
                         headers,
-                        skip_compression,
+                        active_brotli.as_ref(),
                     )
                     .body(Vec::<u8>::new());
                     mark_skip_cors(&mut response, skip_cors);
                     return response;
                 }
-                let stream = create_sse_stream(content_obj, is_async_generator, ping_interval);
-                let mut response =
-                    response_builder::build_sse_response(parsed.status, headers, skip_compression)
-                        .streaming(stream);
+                let stream = create_sse_stream(
+                    content_obj,
+                    is_async_generator,
+                    ping_interval,
+                    active_brotli,
+                );
+                let mut response = response_builder::build_sse_response(
+                    parsed.status,
+                    headers,
+                    active_brotli.as_ref(),
+                )
+                .streaming(stream);
                 mark_skip_cors(&mut response, skip_cors);
                 return response;
             }
 
+            // Non-SSE streaming path. When per-chunk brotli is active, set the
+            // encoding headers and wrap the body stream with the brotli adapter
+            // — the global compression middleware bypasses any pre-set
+            // Content-Encoding so we are never double-compressed.
             let mut builder = HttpResponse::build(parsed.status);
             for (k, v) in headers {
                 builder.append_header((k, v));
             }
+            if active_brotli.is_some() {
+                builder.insert_header(("Content-Encoding", "br"));
+                builder.insert_header(("Vary", "Accept-Encoding"));
+            } else if skip_compression {
+                builder.insert_header(("Content-Encoding", "identity"));
+            }
             if is_head_request {
-                if skip_compression {
-                    builder.append_header(("Content-Encoding", "identity"));
-                }
                 let mut response = builder.body(Vec::<u8>::new());
                 mark_skip_cors(&mut response, skip_cors);
                 return response;
             }
-            if skip_compression {
-                builder.append_header(("Content-Encoding", "identity"));
-            }
-            let stream = create_python_stream(content_obj, is_async_generator);
+            let inner = create_python_stream(content_obj, is_async_generator);
+            let stream = crate::streaming::maybe_wrap_brotli(inner, active_brotli);
             let mut response = builder.streaming(stream);
             mark_skip_cors(&mut response, skip_cors);
             response
@@ -615,9 +679,10 @@ pub async fn response_from_wire_result(
     skip_compression: bool,
     skip_cors: bool,
     is_head_request: bool,
+    req: &HttpRequest,
 ) -> PyResult<HttpResponse> {
     let parsed = Python::attach(|py| parse_response_wire(py, &result_obj))?;
-    Ok(build_response_from_parsed(parsed, skip_compression, skip_cors, is_head_request).await)
+    Ok(build_response_from_parsed(parsed, skip_compression, skip_cors, is_head_request, req).await)
 }
 
 /// Build prebound Python args/kwargs from Rust binding metadata.
@@ -1231,7 +1296,8 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         // Sync dispatch completed but body needs async post-processing (stream/file).
         // Already parsed — no duplicate GIL acquire or wire re-parse.
         Ok(DispatchOutcome::SyncResult(parsed)) => {
-            build_response_from_parsed(parsed, skip_compression, skip_cors, is_head_request).await
+            build_response_from_parsed(parsed, skip_compression, skip_cors, is_head_request, &req)
+                .await
         }
         Ok(DispatchOutcome::Pending(fut)) => match fut.await {
             Ok(result_obj) => {
@@ -1240,6 +1306,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                     skip_compression,
                     skip_cors,
                     is_head_request,
+                    &req,
                 )
                 .await
                 {
