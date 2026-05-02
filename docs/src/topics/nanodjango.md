@@ -183,53 +183,83 @@ nanodjango manage myapp.py runbolt --port 8001
 | `--backlog` | `1024` | Socket listen backlog |
 | `--keep-alive` | OS default | HTTP keep-alive timeout (seconds) |
 
-## Streaming responses (SSE / Datastar)
+## Streaming responses (SSE)
 
-Django-Bolt's `StreamingResponse` pairs well with Server-Sent Events and libraries like [datastar](https://data-star.dev/). By default the Actix layer may compress and batch stream chunks; for real-time streams you need to opt out.
-
-The simplest way is the `@no_compress` decorator:
+For Server-Sent Events, use `EventSourceResponse`. It handles JSON encoding, SSE wire framing (`data: ...\n\n`), keep-alive pings, and skipping compression -- compression buffers stream chunks and breaks real-time delivery.
 
 ```python
+import asyncio
+from collections.abc import AsyncIterable
+
 from nanodjango import Django
 from django_bolt.nanodjango import BoltAPI
-from django_bolt.middleware import no_compress
-from django_bolt.responses import StreamingResponse
+from django_bolt.responses import EventSourceResponse
 
 app = Django()
 bolt = BoltAPI()
 
 
-@bolt.get("/stream")
-@no_compress
-async def stream(request):
-    import asyncio
-
-    async def generate():
-        for i in range(5):
-            yield f"data: message {i}\n\n".encode()
-            await asyncio.sleep(1)
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-    )
+@bolt.get("/stream", response_class=EventSourceResponse)
+async def stream() -> AsyncIterable[dict]:
+    for i in range(5):
+        yield {"message": f"message {i}"}
+        await asyncio.sleep(1)
 ```
 
-Alternatively, set response headers directly. If you sit behind nginx you likely also want `X-Accel-Buffering: no` to stop nginx from buffering the stream:
+Yielded objects are JSON-serialized and wrapped in SSE framing automatically. See the [Server-Sent Events guide](sse.md) for the explicit form, custom event types, IDs, retry intervals, and ping configuration.
+
+If you need raw bytes / manual framing, the legacy `StreamingResponse` + `@no_compress` decorator combination still works -- but `EventSourceResponse` is the recommended path.
+
+## WebSockets
+
+WebSocket endpoints work the same way as in a non-nanodjango Bolt app -- the plugin doesn't add anything special. Decorate with `@bolt.websocket(path)` and accept a `WebSocket` parameter:
 
 ```python
-StreamingResponse(
-    generate(),
-    media_type="text/event-stream",
-    headers={
-        "Content-Encoding": "identity",  # disable bolt compression middleware
-        "Cache-Control": "no-cache",     # don't cache the stream
-        "X-Accel-Buffering": "no",       # tell nginx not to buffer
-    },
-)
+from nanodjango import Django
+from django_bolt import WebSocket, WebSocketDisconnect
+from django_bolt.nanodjango import BoltAPI
+
+app = Django()
+bolt = BoltAPI()
+
+
+@bolt.websocket("/ws/echo")
+async def echo(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            msg = await websocket.receive_text()
+            await websocket.send_text(f"echo: {msg}")
+    except WebSocketDisconnect:
+        pass
 ```
 
-See the [Server-Sent Events guide](sse.md) for the `EventSourceResponse` helper, which handles framing, compression skipping, and keep-alive pings automatically.
+A connecting client (browser):
+
+```javascript
+const ws = new WebSocket(`ws://${location.host}/ws/echo`);
+ws.onmessage = (e) => console.log(e.data);
+ws.onopen = () => ws.send("hello");
+```
+
+Path parameters, JSON helpers, guards, and auth all work the same as documented in the [WebSocket guide](websocket.md).
+
+## Constructing inside a factory
+
+The plugin uses frame inspection at `BoltAPI()` construction time to figure out which module owns the instance, so it can set `BOLT_API` correctly. This works as long as you call `BoltAPI()` at module top level (the typical single-file pattern).
+
+If you wrap construction in a factory or helper, frame inspection will pick up the wrong module and `runbolt` won't find your routes. Pass `module=__name__` explicitly to bypass it:
+
+```python
+def make_bolt():
+    bolt = BoltAPI(module=__name__)  # or "myapp" / wherever the binding lives
+    ...
+    return bolt
+
+bolt = make_bolt()
+```
+
+The plugin emits a warning to the `django_bolt.nanodjango` logger when auto-detection fails, so you'll see the issue at startup rather than getting a silent empty router.
 
 ## Converting to a full project
 

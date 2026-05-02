@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import logging
 import sys
 import types
 from importlib.metadata import entry_points
@@ -11,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from django.conf import settings
 
+from django_bolt import WebSocket
 from django_bolt.api import BoltAPI as RealBoltAPI
 from django_bolt.nanodjango import (
     BoltAPI,
@@ -70,13 +72,80 @@ class TestBoltAPIInit:
         bolt = BoltAPI()
         assert isinstance(bolt, RealBoltAPI)
 
+    def test_explicit_module_kwarg_overrides_frame_detection(self):
+        """Escape hatch for BoltAPI() constructed inside a factory/helper,
+        where frame inspection would pick up the wrong module."""
+        bolt = BoltAPI(module="explicit.module.name")
+        assert bolt._module_name == "explicit.module.name"
+
+
+@pytest.fixture
+def capture_nanodjango_warnings():
+    """Attach a capture handler directly to the ``django_bolt.nanodjango``
+    logger.
+
+    Can't use pytest's ``caplog`` because the django_bolt logging
+    bootstrap (when triggered by full-suite test order) sets
+    ``logger.propagate = False`` on the ``django_bolt`` logger, so records
+    never reach caplog's root handler.
+    """
+    logger = logging.getLogger("django_bolt.nanodjango")
+    records: list[logging.LogRecord] = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _ListHandler(level=logging.WARNING)
+    prev_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.WARNING)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(prev_level)
+
+
+class TestConfigureBoltAPIWarnsOnDetectionFailure:
+    def test_warns_when_self_not_in_module_globals(self, capture_nanodjango_warnings):
+        """If frame-detected module exists but doesn't contain `self`, warn.
+
+        This is the silent-failure scenario: a user constructs BoltAPI()
+        inside a function, so the variable isn't in module globals.
+        Without a warning, BOLT_API never gets set and runbolt finds no
+        routes — no signal to the user about why.
+        """
+        mod = types.ModuleType("fake_warn_module")
+        sys.modules["fake_warn_module"] = mod
+        try:
+            bolt = BoltAPI(module="fake_warn_module")
+            # mod has no reference to bolt — simulates factory-construction
+
+            bolt._configure_bolt_api()
+
+            messages = [r.getMessage().lower() for r in capture_nanodjango_warnings]
+            assert any("could not auto-configure" in m for m in messages), (
+                f"expected warning about auto-configuration failure, got: {messages}"
+            )
+        finally:
+            del sys.modules["fake_warn_module"]
+
+    def test_warns_when_module_missing(self, capture_nanodjango_warnings):
+        """sys.modules miss is a different (rarer) failure mode and should
+        also warn, but separately — keep it explicit."""
+        bolt = BoltAPI(module="totally.nonexistent.module.xyz")
+
+        bolt._configure_bolt_api()
+
+        messages = [r.getMessage().lower() for r in capture_nanodjango_warnings]
+        assert any("could not auto-configure" in m for m in messages)
+
 
 class TestConfigureBoltAPI:
     def test_sets_bolt_api_setting_on_first_route(self):
-        # Create a fake module and register our BoltAPI instance in it
         mod = types.ModuleType("fake_module_for_test")
-        bolt = BoltAPI()
-        bolt._module_name = "fake_module_for_test"
+        bolt = BoltAPI(module="fake_module_for_test")
         mod.my_bolt = bolt
         sys.modules["fake_module_for_test"] = mod
 
@@ -101,19 +170,30 @@ class TestConfigureBoltAPI:
             del settings.BOLT_API
 
         bolt._configure_bolt_api()
-        assert not hasattr(settings, "BOLT_API") or "BOLT_API" not in dir(settings)
+        assert not hasattr(settings, "BOLT_API")
 
     def test_skips_if_module_not_found(self):
-        bolt = BoltAPI()
-        bolt._module_name = "nonexistent_module_xyz"
+        """When the module is missing from sys.modules, mark configured to
+        suppress repeated warnings on every subsequent route decorator, and
+        leave BOLT_API alone."""
+        bolt = BoltAPI(module="nonexistent_module_xyz")
+
+        had_bolt_api = hasattr(settings, "BOLT_API")
+        before = list(settings.BOLT_API) if had_bolt_api else None
 
         bolt._configure_bolt_api()
-        assert bolt._bolt_api_configured is False
+
+        # Configured flag set so we don't warn repeatedly
+        assert bolt._bolt_api_configured is True
+        # BOLT_API untouched
+        if had_bolt_api:
+            assert list(settings.BOLT_API) == before
+        else:
+            assert not hasattr(settings, "BOLT_API")
 
     def test_no_duplicate_bolt_api_entries(self):
         mod = types.ModuleType("fake_module_dedup")
-        bolt = BoltAPI()
-        bolt._module_name = "fake_module_dedup"
+        bolt = BoltAPI(module="fake_module_dedup")
         mod.api = bolt
         sys.modules["fake_module_dedup"] = mod
 
@@ -126,116 +206,37 @@ class TestConfigureBoltAPI:
             del sys.modules["fake_module_dedup"]
 
 
-class TestHTTPMethodDecorators:
-    """Each HTTP method decorator should trigger _configure_bolt_api."""
+class TestRouteDecoratorsHookConfigure:
+    """Every route decorator must trigger ``_configure_bolt_api``."""
 
-    def _make_bolt_in_module(self):
+    @pytest.fixture
+    def bolt_in_module(self):
         mod = types.ModuleType("fake_mod_http")
-        bolt = BoltAPI()
-        bolt._module_name = "fake_mod_http"
+        bolt = BoltAPI(module="fake_mod_http")
         mod.bolt = bolt
         sys.modules["fake_mod_http"] = mod
-        return bolt, mod
-
-    def _cleanup(self):
-        sys.modules.pop("fake_mod_http", None)
-
-    def test_get_triggers_configure(self):
-        bolt, mod = self._make_bolt_in_module()
         try:
-            assert bolt._bolt_api_configured is False
-
-            @bolt.get("/test")
-            async def handler(request):
-                return {"ok": True}
-
-            assert bolt._bolt_api_configured is True
+            yield bolt
         finally:
-            self._cleanup()
+            sys.modules.pop("fake_mod_http", None)
 
-    def test_post_triggers_configure(self):
-        bolt, mod = self._make_bolt_in_module()
-        try:
+    @pytest.mark.parametrize("verb", ["get", "post", "put", "patch", "delete", "head", "options"])
+    def test_http_verb_triggers_configure(self, bolt_in_module, verb):
+        assert bolt_in_module._bolt_api_configured is False
+        decorator = getattr(bolt_in_module, verb)
 
-            @bolt.post("/test")
-            async def handler(request):
-                return {"ok": True}
+        @decorator("/test")
+        async def handler(request):
+            return {"ok": True}
 
-            assert bolt._bolt_api_configured is True
-        finally:
-            self._cleanup()
+        assert bolt_in_module._bolt_api_configured is True
 
-    def test_put_triggers_configure(self):
-        bolt, mod = self._make_bolt_in_module()
-        try:
+    def test_websocket_triggers_configure(self, bolt_in_module):
+        @bolt_in_module.websocket("/test")
+        async def handler(websocket: WebSocket):
+            pass
 
-            @bolt.put("/test")
-            async def handler(request):
-                return {"ok": True}
-
-            assert bolt._bolt_api_configured is True
-        finally:
-            self._cleanup()
-
-    def test_patch_triggers_configure(self):
-        bolt, mod = self._make_bolt_in_module()
-        try:
-
-            @bolt.patch("/test")
-            async def handler(request):
-                return {"ok": True}
-
-            assert bolt._bolt_api_configured is True
-        finally:
-            self._cleanup()
-
-    def test_delete_triggers_configure(self):
-        bolt, mod = self._make_bolt_in_module()
-        try:
-
-            @bolt.delete("/test")
-            async def handler(request):
-                return {"ok": True}
-
-            assert bolt._bolt_api_configured is True
-        finally:
-            self._cleanup()
-
-    def test_head_triggers_configure(self):
-        bolt, mod = self._make_bolt_in_module()
-        try:
-
-            @bolt.head("/test")
-            async def handler(request):
-                return {"ok": True}
-
-            assert bolt._bolt_api_configured is True
-        finally:
-            self._cleanup()
-
-    def test_options_triggers_configure(self):
-        bolt, mod = self._make_bolt_in_module()
-        try:
-
-            @bolt.options("/test")
-            async def handler(request):
-                return {"ok": True}
-
-            assert bolt._bolt_api_configured is True
-        finally:
-            self._cleanup()
-
-    def test_websocket_triggers_configure(self):
-        bolt, mod = self._make_bolt_in_module()
-        try:
-
-            @bolt.websocket("/test")
-            async def handler(request):
-                pass
-
-            assert bolt._bolt_api_configured is True
-        finally:
-            self._cleanup()
+        assert bolt_in_module._bolt_api_configured is True
 
 
 class TestDjangoPreSetup:
@@ -291,6 +292,16 @@ class TestConvertBuildSettings:
         # Should not raise
         convert_build_settings(MagicMock(), MagicMock(), settings_ast)
 
+    def test_does_not_duplicate_existing_django_bolt(self):
+        """Django raises if INSTALLED_APPS contains the same app twice."""
+        source = "INSTALLED_APPS = ['django.contrib.auth', 'django_bolt']"
+        settings_ast = ast.parse(source)
+
+        convert_build_settings(MagicMock(), MagicMock(), settings_ast)
+
+        values = [e.value for e in settings_ast.body[0].value.elts]
+        assert values.count("django_bolt") == 1
+
 
 def _make_converter(source: str):
     """Build a mock converter from Python source code."""
@@ -314,9 +325,7 @@ class TestConvertBuildAppApi:
         resolver = _make_resolver()
         extra_src = []
 
-        result_resolver, result_src = convert_build_app_api(
-            converter, resolver, extra_src
-        )
+        result_resolver, result_src = convert_build_app_api(converter, resolver, extra_src)
 
         resolver.add_object.assert_any_call("bolt")
         assert len(result_src) == 1
@@ -455,9 +464,7 @@ async def route_b(request):
         resolver = _make_resolver()
         extra_src = []
 
-        result_resolver, result_src = convert_build_app_api(
-            converter, resolver, extra_src
-        )
+        result_resolver, result_src = convert_build_app_api(converter, resolver, extra_src)
 
         resolver.add_object.assert_not_called()
         assert len(result_src) == 0
@@ -566,7 +573,5 @@ class TestEntryPointWiring:
         module = ep.load()
 
         for hook_name in ("django_pre_setup", "convert_build_settings", "convert_build_app_api"):
-            assert hasattr(module, hook_name), (
-                f"loaded plugin module missing {hook_name}"
-            )
+            assert hasattr(module, hook_name), f"loaded plugin module missing {hook_name}"
             assert callable(getattr(module, hook_name))

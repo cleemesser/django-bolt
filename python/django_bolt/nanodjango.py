@@ -19,8 +19,11 @@ Run with: python myapp.py runbolt --port 8001
 Install: pip install "django-bolt[nanodjango]"
 """
 
+from __future__ import annotations
+
 import ast
 import inspect
+import logging
 import sys
 from typing import Any
 
@@ -30,7 +33,9 @@ from nanodjango.convert.utils import collect_references, get_decorators
 
 from .api import BoltAPI as _RealBoltAPI
 
-_HTTP_METHODS: tuple[str, ...] = (
+logger = logging.getLogger(__name__)
+
+_BOLT_DECORATOR_NAMES: tuple[str, ...] = (
     "get",
     "post",
     "put",
@@ -40,6 +45,7 @@ _HTTP_METHODS: tuple[str, ...] = (
     "options",
     "websocket",
 )
+_BOLT_MOUNT_NAMES: tuple[str, ...] = ("mount_django", "mount")
 
 
 class BoltAPI(_RealBoltAPI):
@@ -57,15 +63,24 @@ class BoltAPI(_RealBoltAPI):
     django-bolt's ``runbolt`` autodiscovery finds it correctly.
     """
 
-    def __init__(self, **kwargs: Any) -> None:
-        # Capture calling module name before super().__init__ changes the frame
-        frame = inspect.currentframe()
-        self._module_name: str = frame.f_back.f_globals.get("__name__", "__main__")
+    def __init__(self, *, module: str | None = None, **kwargs: Any) -> None:
+        if module is None:
+            frame = inspect.currentframe()
+            try:
+                module = frame.f_back.f_globals.get("__name__", "__main__")
+            finally:
+                # Drop the frame ref before super().__init__ to avoid a cycle.
+                del frame
+        self._module_name: str = module
         self._bolt_api_configured: bool = False
 
         super().__init__(**kwargs)
 
-        # Add django_bolt to INSTALLED_APPS immediately on instantiation
+        # Inline import: this module is loaded by nanodjango's plugin manager
+        # during ``Django()`` construction, before ``settings.configure()``.
+        # A module-top ``from django.conf import settings`` would expose the
+        # lazy ``settings`` proxy to pluggy's attribute walk and trigger
+        # ``ImproperlyConfigured`` via ``inspect.isroutine``.
         from django.conf import settings  # noqa: PLC0415
 
         if "django_bolt" not in settings.INSTALLED_APPS:
@@ -81,11 +96,13 @@ class BoltAPI(_RealBoltAPI):
         """
         if self._bolt_api_configured:
             return
+        self._bolt_api_configured = True
 
         from django.conf import settings  # noqa: PLC0415
 
         module = sys.modules.get(self._module_name)
         if module is None:
+            self._warn_autoconfig_failed(f"module {self._module_name!r} is not in sys.modules")
             return
 
         for name, val in vars(module).items():
@@ -95,41 +112,28 @@ class BoltAPI(_RealBoltAPI):
                 if entry not in existing:
                     existing.append(entry)
                     settings.BOLT_API = existing
-                self._bolt_api_configured = True
                 return
 
-    # Override each HTTP method to configure BOLT_API before registering routes
-    def get(self, path: str, **kwargs: Any) -> Any:
-        self._configure_bolt_api()
-        return super().get(path, **kwargs)
+        self._warn_autoconfig_failed(
+            f"BoltAPI instance not found in globals of module {self._module_name!r} "
+            "(usually means BoltAPI() was constructed inside a function rather than "
+            "at module top-level)"
+        )
 
-    def post(self, path: str, **kwargs: Any) -> Any:
-        self._configure_bolt_api()
-        return super().post(path, **kwargs)
+    def _warn_autoconfig_failed(self, reason: str) -> None:
+        logger.warning(
+            "django_bolt.nanodjango: could not auto-configure BOLT_API — %s. "
+            "Pass module=__name__ to BoltAPI() or set settings.BOLT_API manually.",
+            reason,
+        )
 
-    def put(self, path: str, **kwargs: Any) -> Any:
+    def _route_decorator(self, *args: Any, **kwargs: Any) -> Any:
         self._configure_bolt_api()
-        return super().put(path, **kwargs)
+        return super()._route_decorator(*args, **kwargs)
 
-    def patch(self, path: str, **kwargs: Any) -> Any:
+    def _websocket_decorator(self, *args: Any, **kwargs: Any) -> Any:
         self._configure_bolt_api()
-        return super().patch(path, **kwargs)
-
-    def delete(self, path: str, **kwargs: Any) -> Any:
-        self._configure_bolt_api()
-        return super().delete(path, **kwargs)
-
-    def head(self, path: str, **kwargs: Any) -> Any:
-        self._configure_bolt_api()
-        return super().head(path, **kwargs)
-
-    def options(self, path: str, **kwargs: Any) -> Any:
-        self._configure_bolt_api()
-        return super().options(path, **kwargs)
-
-    def websocket(self, path: str, **kwargs: Any) -> Any:
-        self._configure_bolt_api()
-        return super().websocket(path, **kwargs)
+        return super()._websocket_decorator(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -166,8 +170,63 @@ def convert_build_settings(converter: Converter, resolver: Resolver, settings_as
             and any(isinstance(t, ast.Name) and t.id == "INSTALLED_APPS" for t in node.targets)
             and isinstance(node.value, ast.List)
         ):
-            node.value.elts.append(ast.Constant(value="django_bolt"))
+            already_present = any(
+                isinstance(elt, ast.Constant) and elt.value == "django_bolt" for elt in node.value.elts
+            )
+            if not already_present:
+                node.value.elts.append(ast.Constant(value="django_bolt"))
             break
+
+
+def _is_bolt_assignment(node: ast.AST, api_objs: set[str], resolver: Resolver) -> bool:
+    """Detect ``bolt = BoltAPI(...)`` or ``bolt = something.BoltAPI(...)``."""
+    if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)):
+        return False
+    func = node.value.func
+    if isinstance(func, ast.Name):
+        func_name = func.id
+    elif isinstance(func, ast.Attribute):
+        func_name = func.attr
+    else:
+        return False
+    if func_name != "BoltAPI":
+        return False
+    for target in node.targets:
+        if isinstance(target, ast.Name):
+            api_objs.add(target.id)
+            resolver.add_object(target.id)
+    return True
+
+
+def _is_bolt_decorated_function(node: ast.AST, api_objs: set[str], resolver: Resolver) -> bool:
+    """Detect ``@bolt.get(...)`` / ``@bolt.websocket(...)`` etc. on a function def."""
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    for decorator in get_decorators(node):
+        if isinstance(decorator, ast.Call):
+            decorator = decorator.func
+        if (
+            isinstance(decorator, ast.Attribute)
+            and isinstance(decorator.value, ast.Name)
+            and decorator.value.id in api_objs
+            and decorator.attr in _BOLT_DECORATOR_NAMES
+        ):
+            resolver.add_object(node.name)
+            return True
+    return False
+
+
+def _is_bolt_mount_call(node: ast.AST, api_objs: set[str]) -> bool:
+    """Detect ``bolt.mount_django(...)`` or ``bolt.mount(...)`` expression statements."""
+    if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)):
+        return False
+    func = node.value.func
+    return (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+        and func.value.id in api_objs
+        and func.attr in _BOLT_MOUNT_NAMES
+    )
 
 
 @hookimpl
@@ -184,57 +243,14 @@ def convert_build_app_api(converter: Converter, resolver: Resolver, extra_src: l
     """
     api_objs: set[str] = set()
 
-    for obj_ast in converter.ast.body:
-        is_bolt: bool = False
-
-        # Detect: bolt = BoltAPI(...) or bolt = something.BoltAPI(...)
-        if isinstance(obj_ast, ast.Assign) and isinstance(obj_ast.value, ast.Call):
-            func: ast.expr = obj_ast.value.func
-            func_name: str | None = None
-            if isinstance(func, ast.Name):
-                func_name = func.id
-            elif isinstance(func, ast.Attribute):
-                func_name = func.attr
-
-            if func_name == "BoltAPI":
-                for target in obj_ast.targets:
-                    if isinstance(target, ast.Name):
-                        api_objs.add(target.id)
-                        resolver.add_object(target.id)
-                is_bolt = True
-
-        # Detect: @bolt.get/post/... on async or sync function defs
-        elif isinstance(obj_ast, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            decorators: list[ast.expr] = get_decorators(obj_ast)
-            for decorator in decorators:
-                if isinstance(decorator, ast.Call):
-                    decorator = decorator.func
-
-                if (
-                    isinstance(decorator, ast.Attribute)
-                    and isinstance(decorator.value, ast.Name)
-                    and decorator.value.id in api_objs
-                    and decorator.attr in _HTTP_METHODS
-                ):
-                    resolver.add_object(obj_ast.name)
-                    is_bolt = True
-                    break
-
-        # Detect: bolt.mount_django(...) or bolt.mount(...)
-        elif isinstance(obj_ast, ast.Expr) and isinstance(obj_ast.value, ast.Call):
-            func = obj_ast.value.func
-            if (
-                isinstance(func, ast.Attribute)
-                and isinstance(func.value, ast.Name)
-                and func.value.id in api_objs
-                and func.attr in ("mount_django", "mount")
-            ):
-                is_bolt = True
-
+    for node in converter.ast.body:
+        is_bolt = (
+            _is_bolt_assignment(node, api_objs, resolver)
+            or _is_bolt_decorated_function(node, api_objs, resolver)
+            or _is_bolt_mount_call(node, api_objs)
+        )
         if is_bolt:
-            src: str = ast.unparse(obj_ast)
-            references: set[str] = collect_references(obj_ast)
-            resolver.add_references(references)
-            extra_src.append(src)
+            extra_src.append(ast.unparse(node))
+            resolver.add_references(collect_references(node))
 
     return resolver, extra_src
