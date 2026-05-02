@@ -43,7 +43,118 @@ A second, terminal flush is performed when the inner stream ends — see
 "`Poll::Ready(None)` branch" below.
 
 ---
+## Usage - Set on the response at construction (Python):
 
+```python
+from django_bolt.responses import StreamingResponse # or EventSourceResponse
+
+return StreamingResponse(
+    generator(),
+    compress="br",
+    brotli_quality=5,
+    brotli_lgwin=14,   # ← 16 KiB window per connection down from default of 18
+)
+
+
+## Marginal memory cost of adding the compressor
+
+Cost is **on top of** an uncompressed streaming connection. If `compress=None`,
+`maybe_wrap_brotli` is pass-through (`src/streaming.rs:241`) — marginal cost is
+**0**.
+
+| Source | Default (`q=5, lgwin=18`) | Notes |
+|---|---|---|
+| Brotli sliding window | **256 KiB** (`2^lgwin`) | dominant cost |
+| Brotli hash tables (back-ref index) | **~tens of KiB** at q=5 | grows with quality; q=11 reaches hundreds of KiB |
+| `CompressorWriter` internal output buffer | **4 KiB** | `CompressorWriter::new(sink, 4096, ...)` (`src/streaming_compression.rs:114`) |
+| `SinkWriter.buf` preallocated capacity | **4 KiB** | `Vec::with_capacity(4096)` (`src/streaming_compression.rs:112`) |
+| Outer `Box` from `Box::pin(BrotliStream::new(...))` | **~hundreds of bytes** inline (mostly `CompressorWriter` embedded in `Option`) | `src/streaming.rs:238` |
+
+**Total marginal at defaults: ~270 KiB per connection**, almost entirely the
+sliding window.
+
+### What's *not* extra per connection
+
+- The inner Python stream / keepalive wrapper / `Py<PyAny>` for the generator
+  exist regardless of compression. `BrotliStream` moves the inner stream into
+  itself — no duplication.
+- The 4 KiB `SinkWriter.buf` is reused. Every `flush()` does `mem::take`,
+  leaving an empty `Vec` with its capacity preserved for the next event.
+  Steady-state, not per-event growth.
+- No per-event allocation in steady state beyond the `Bytes` handed
+  downstream.
+
+---
+
+## Tuning — `lgwin` (window log size)
+
+`lgwin` is the dominant memory knob. Window size = `2^lgwin` bytes per
+connection.
+
+| `lgwin`              | Window      | Marginal/conn (≈) | 1k conns    | 10k conns   |
+|----------------------|-------------|-------------------|-------------|-------------|
+| 10 (min)             | 1 KiB       | ~10 KiB           | 10 MiB      | 100 MiB     |
+| 14                   | 16 KiB      | ~24 KiB           | 24 MiB      | 240 MiB     |
+| 16                   | 64 KiB      | ~72 KiB           | 72 MiB      | 720 MiB     |
+| **18 (default)**     | **256 KiB** | **~270 KiB**      | **270 MiB** | **2.7 GiB** |
+| 20                   | 1 MiB       | ~1 MiB            | 1 GiB       | 10 GiB      |
+| 22 (brotli "normal") | 4 MiB       | ~4 MiB            | 4 GiB       | 40 GiB      |
+| 24 (max)             | 16 MiB      | ~16 MiB           | 16 GiB      | 160 GiB     |
+
+The brotli RFC notes that for short messages a smaller window costs almost
+nothing in compression ratio. For SSE, where each event is typically a small
+JSON payload, the window mostly helps with **cross-event vocabulary reuse**
+(repeated keys, repeated string fragments). 256 KiB is plenty for that; values
+above 18 are usually wasted dictionary you'll never fill. In future I may event
+consider a lower default like 14 with the idea that you will know if you send
+large payloads and can increase the value.
+
+### When to drop `lgwin` below 18
+
+- High fan-out SSE servers (thousands of concurrent clients) where 256 KiB ×
+  N is uncomfortable.
+- Small, self-contained events with little cross-event repetition.
+- Try `lgwin=14` (16 KiB) or `lgwin=16` (64 KiB) — usually within ~1–3% of
+  default ratio for SSE-shaped traffic, at a fraction of the memory.
+
+### When to raise `lgwin`
+
+- Large bodies (file streams, big JSON arrays) with lots of long-range
+  repetition. Even then, 20 is usually enough; 22+ is for archival use cases,
+  not live streaming.
+
+---
+
+## Tuning — `quality`
+
+`quality` (0..=11) trades CPU for compression ratio. It also affects memory
+via hash table sizes, but `lgwin` is far more impactful.
+
+- **0–3**: very fast, modest ratio. Reasonable for tiny payloads where the
+  fixed brotli overhead dominates.
+- **4–6**: balanced. **Default `5`** is a sensible streaming choice.
+- **7–9**: slower, better ratio. Worth it for cacheable bulk responses, not
+  hot streaming paths.
+- **10–11**: very slow encoder; hash tables can grow to hundreds of KiB; do
+  not use on streaming endpoints under load.
+
+Per-event flush (`BROTLI_OPERATION_FLUSH`) caps achievable ratio anyway —
+each flush ends a self-contained block — so high quality buys less on
+streaming than on one-shot compression.
+
+---
+
+## Quick capacity-planning rules
+
+- Marginal cost ≈ **`2^lgwin` + small constant (~12 KiB)**.
+- Per-connection budget = `2^lgwin` × concurrent compressed streams.
+- `compress=None` connections cost nothing from this module.
+- Multi-process: each worker process has its own per-connection memory; total
+  = workers × concurrent-conns-per-worker × `2^lgwin`.
+
+
+
+---
 ## Public surface
 
 ### `StreamBrotliConfig` (`:19`)
