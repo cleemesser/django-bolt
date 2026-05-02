@@ -84,7 +84,6 @@ jobs:
 
   server_integration_linux:
     name: Server Integration Linux Python ${{ matrix.python-version }}
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
