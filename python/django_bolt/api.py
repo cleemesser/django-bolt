@@ -1415,6 +1415,17 @@ class BoltAPI:
             meta["_original_fn"] = fn
             meta["_handler_executor"] = self._compile_handler_executor(meta)
 
+            # ViewSet write actions resolve their body type from the configured
+            # serializer class. Inject it as a first-class body_struct_type so
+            # the OpenAPI generator and existing JSON-body machinery treat it
+            # identically to a handler that declared `body: Serializer` in its
+            # signature. Runtime body deserialization is unaffected because
+            # there is no matching field in field_definitions.
+            body_struct_type = getattr(fn, "__bolt_body_struct_type__", None)
+            if body_struct_type is not None and "body_struct_type" not in meta:
+                meta["body_struct_param"] = "body"
+                meta["body_struct_type"] = body_struct_type
+
             # Normalize route-level middleware declared via @middleware / @cors / @rate_limit.
             # Validation happens at registration time to fail fast and deterministically.
             route_middleware = normalize_middleware_specs(

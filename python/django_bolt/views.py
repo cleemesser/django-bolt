@@ -153,6 +153,17 @@ class APIView:
         view_handler.__signature__ = new_sig
         view_handler.__annotations__ = {k: v for k, v in inspect.get_annotations(method_handler).items() if k != "self"}
 
+        # Resolve the request body type for write actions only when the
+        # ViewSet configures a serializer class. ViewSets that don't (because
+        # each action declares its own typed body parameter, or it is a plain
+        # ViewSet without a default serializer) are left alone — compile_binder
+        # picks up the handler-declared body type via the function signature.
+        if action_name in {"create", "update", "partial_update"} and any(
+            getattr(cls, attr, None) is not None
+            for attr in ("serializer_class", "create_serializer_class", "update_serializer_class")
+        ):
+            view_handler.__bolt_body_struct_type__ = cls._get_default_serializer_class(action_name)
+
         # Preserve docstring and name
         view_handler.__name__ = f"{cls.__name__}.{action_name}"
         view_handler.__doc__ = method_handler.__doc__

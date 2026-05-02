@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import http.client
 import inspect
+import re
 from dataclasses import replace
 from typing import TYPE_CHECKING, Annotated, Any, Literal, get_args, get_origin
 
@@ -37,6 +38,14 @@ _SCHEME_NAME_MAP: dict[str, str] = {
     "jwt": "BearerAuth",
     "api_key": "ApiKeyAuth",
 }
+
+
+_PATH_PARAM_RE = re.compile(r"{([^{}]+)}")
+
+
+def _extract_path_param_names(path: str) -> list[str]:
+    """Return path parameter names declared in a route path (e.g. {pk} → "pk")."""
+    return _PATH_PARAM_RE.findall(path)
 
 
 class SchemaGenerator:
@@ -493,6 +502,27 @@ class SchemaGenerator:
                 description=f"Parameter {alias}",
             )
             parameters.append(parameter)
+
+        # Every path parameter declared in the route URL must appear in the
+        # OpenAPI spec, even when the handler resolves it indirectly (e.g.
+        # ViewSet mixins read {pk} from self.request.params instead of binding
+        # it as a function argument). Handlers that declare the parameter
+        # explicitly already produced a typed entry above; the URL-declared
+        # ones fill in the rest with the OpenAPI-default string type.
+        bound_path_names = {p.name for p in parameters if p.param_in == "path"}
+        for param_name in _extract_path_param_names(path):
+            if param_name in bound_path_names:
+                continue
+            parameters.append(
+                Parameter(
+                    name=param_name,
+                    param_in="path",
+                    required=True,
+                    schema=Schema(type="string"),
+                    description=f"Parameter {param_name}",
+                )
+            )
+            bound_path_names.add(param_name)
 
         return parameters
 
