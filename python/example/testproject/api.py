@@ -935,11 +935,18 @@ async def sse_new_explicit():
 
 @api.get("/sse/brotli-demo")
 async def brotli_demo():
+    """Server send events with brotli compression enabled
+
+    this compresses a lot with brotli because of the redundancy
+    but preserves realtime steraming
+    in my test: 4.5 kB resources effectively transferred but only 651 B transferred
+    over the wire with the default brotli settings"""
     async def gen():
         for i in range(20):
             yield {"i": i, "msg": "x" * 200}
+            await asyncio.sleep(0.2)
 
-    return EventSourceResponse(gen(), compress="br")
+    return EventSourceResponse(gen(), compress="br") # default brotli_lgwin=14, brotli_quality=5
 
 
 # ==== OpenAI-style Chat Completions (streaming/non-streaming) ====
