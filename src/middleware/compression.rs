@@ -170,25 +170,28 @@ mod bypass_tests {
         // The body must be >= minimum_size (default 500 bytes) to trigger the
         // compression path in the middleware. With a short body the middleware
         // skips compression regardless, which would hide the bug we are testing.
-        let large_body: Vec<u8> = b"already-compressed-bytes-".iter().cycle().take(600).cloned().collect();
+        let large_body: Vec<u8> = b"already-compressed-bytes-"
+            .iter()
+            .cycle()
+            .take(600)
+            .cloned()
+            .collect();
         let large_body_clone = large_body.clone();
 
-        let app = test::init_service(
-            App::new().wrap(CompressionMiddleware::new()).route(
-                "/",
-                web::get().to(move || {
-                    let body = large_body_clone.clone();
-                    async move {
-                        HttpResponse::Ok()
-                            .insert_header((
-                                HeaderName::from_static("content-encoding"),
-                                HeaderValue::from_static("br"),
-                            ))
-                            .body(body)
-                    }
-                }),
-            ),
-        )
+        let app = test::init_service(App::new().wrap(CompressionMiddleware::new()).route(
+            "/",
+            web::get().to(move || {
+                let body = large_body_clone.clone();
+                async move {
+                    HttpResponse::Ok()
+                        .insert_header((
+                            HeaderName::from_static("content-encoding"),
+                            HeaderValue::from_static("br"),
+                        ))
+                        .body(body)
+                }
+            }),
+        ))
         .await;
 
         let req = TestRequest::get()

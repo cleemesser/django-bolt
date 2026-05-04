@@ -235,9 +235,7 @@ pub fn maybe_wrap_brotli(
     compression: Option<crate::streaming_compression::StreamBrotliConfig>,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
     match compression {
-        Some(cfg) => Box::pin(crate::streaming_compression::BrotliStream::new(
-            inner, cfg,
-        )),
+        Some(cfg) => Box::pin(crate::streaming_compression::BrotliStream::new(inner, cfg)),
         None => inner,
     }
 }

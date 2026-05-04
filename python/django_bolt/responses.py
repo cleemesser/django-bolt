@@ -296,7 +296,7 @@ class StreamingResponse(CookieMixin):
         headers: dict[str, str] | None = None,
         compress: Literal["br"] | None = None,
         brotli_quality: int = 5,  # should I just have a compression config dict?
-        brotli_lgwin: int = 14, # sliding window of size 2^brotli_lgwin = 16k default
+        brotli_lgwin: int = 14,  # sliding window of size 2^brotli_lgwin = 16k default
     ):
         # Validate that content is already a called generator/iterator, not a callable
         if callable(content):
@@ -474,7 +474,7 @@ class EventSourceResponse(StreamingResponse):
         ping_interval: float | None = SSE_DEFAULT_PING_INTERVAL,
         compress: Literal["br"] | None = None,
         brotli_quality: int = 5,
-        brotli_lgwin: int = 14, # 2^brotli_lgwin sliding window default 16k
+        brotli_lgwin: int = 14,  # 2^brotli_lgwin sliding window default 16k
     ):
         super().__init__(
             content,
