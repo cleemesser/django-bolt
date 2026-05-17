@@ -472,6 +472,12 @@ class BoltAPI:
 
             self._dispatch = _dispatch_with_signals
 
+    def _rust_compression_config(self) -> dict | None:
+        """Compression config dict for Rust startup, or `None` when disabled.
+        Used by the production server and `TestClient` / `WebSocketTestClient`
+        setup paths."""
+        return self._compression.to_rust_config() if self._compression else None
+
     def get(
         self,
         path: str,

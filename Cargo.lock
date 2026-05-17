@@ -886,6 +886,7 @@ dependencies = [
  "cookie 0.18.1",
  "ctrlc",
  "dashmap",
+ "flate2",
  "futures-util",
  "governor",
  "jsonwebtoken",
@@ -909,6 +910,7 @@ dependencies = [
  "tokio",
  "urlencoding",
  "uuid",
+ "zstd",
 ]
 
 [[package]]

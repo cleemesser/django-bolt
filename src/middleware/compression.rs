@@ -80,26 +80,23 @@ where
             let res = fut.await?;
 
             // If the response already declares a Content-Encoding, the handler
-            // owns the encoding (e.g. per-event brotli SSE). Pass it through
-            // without re-compressing.
+            // owns the encoding (e.g. per-chunk SSE compression). Pass it
+            // through without re-wrapping.
             //
             // Special case: `identity` is our internal "skip compression"
-            // marker — we strip it before sending so clients don't see it.
-            // Any other value (br, gzip, zstd, etc.) is preserved as-is.
-            let pre_set_encoding = res
+            // marker — strip it so clients don't see it. Any other value
+            // (br, gzip, zstd) is preserved as-is.
+            let pre_set = res
                 .headers()
                 .get(CONTENT_ENCODING)
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.to_ascii_lowercase());
+                .and_then(|v| v.to_str().ok());
 
-            if let Some(encoding) = pre_set_encoding {
+            if let Some(encoding) = pre_set {
+                let is_identity = encoding.eq_ignore_ascii_case("identity");
                 let (req, mut response) = res.into_parts();
-                if encoding == "identity" {
+                if is_identity {
                     response.headers_mut().remove(CONTENT_ENCODING);
                 }
-                // For any pre-set encoding (identity or otherwise), pass the
-                // body through with ContentEncoding::Identity so actix doesn't
-                // wrap it in another encoder.
                 return Ok(ServiceResponse::new(
                     req,
                     response.map_body(|head, body| {
@@ -165,8 +162,7 @@ mod bypass_tests {
     use actix_web::test::{self, TestRequest};
     use actix_web::{web, App, HttpResponse};
 
-    #[actix_web::test]
-    async fn pre_set_brotli_encoding_is_preserved_and_not_double_compressed() {
+    async fn assert_encoding_preserved(pre_set_encoding: &'static str) {
         // The body must be >= minimum_size (default 500 bytes) to trigger the
         // compression path in the middleware. With a short body the middleware
         // skips compression regardless, which would hide the bug we are testing.
@@ -186,7 +182,7 @@ mod bypass_tests {
                     HttpResponse::Ok()
                         .insert_header((
                             HeaderName::from_static("content-encoding"),
-                            HeaderValue::from_static("br"),
+                            HeaderValue::from_static(pre_set_encoding),
                         ))
                         .body(body)
                 }
@@ -196,7 +192,7 @@ mod bypass_tests {
 
         let req = TestRequest::get()
             .uri("/")
-            .insert_header(("accept-encoding", "br, gzip"))
+            .insert_header(("accept-encoding", "br, gzip, zstd"))
             .to_request();
 
         let resp = test::call_service(&app, req).await;
@@ -206,12 +202,29 @@ mod bypass_tests {
             .headers()
             .get("content-encoding")
             .map(|v| v.to_str().unwrap().to_string());
-        assert_eq!(ce, Some("br".to_string()));
+        assert_eq!(ce, Some(pre_set_encoding.to_string()));
 
-        // Body must be passed through unchanged; the middleware must NOT
-        // wrap it in another encoder.
         let body = test::read_body(resp).await;
-        assert_eq!(body.as_ref(), large_body.as_slice());
+        assert_eq!(
+            body.as_ref(),
+            large_body.as_slice(),
+            "body was re-encoded; expected pass-through"
+        );
+    }
+
+    #[actix_web::test]
+    async fn pre_set_brotli_encoding_is_preserved() {
+        assert_encoding_preserved("br").await;
+    }
+
+    #[actix_web::test]
+    async fn pre_set_gzip_encoding_is_preserved() {
+        assert_encoding_preserved("gzip").await;
+    }
+
+    #[actix_web::test]
+    async fn pre_set_zstd_encoding_is_preserved() {
+        assert_encoding_preserved("zstd").await;
     }
 }
 

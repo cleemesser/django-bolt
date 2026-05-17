@@ -1505,7 +1505,9 @@ class TestHandlerCookiesWithDjangoMiddleware:
             response = client.post("/login")
             assert response.status_code == 200
 
-            set_cookie_headers = [value for key, value in response.headers.multi_items() if key.lower() == "set-cookie"]
+            set_cookie_headers = [
+                value for key, value in response.headers.multi_items() if key.lower() == "set-cookie"
+            ]
             joined = "\n".join(set_cookie_headers)
 
             assert len(set_cookie_headers) >= 2, (
@@ -1537,7 +1539,9 @@ class TestHandlerCookiesWithDjangoMiddleware:
             response = client.post("/login")
             assert response.status_code == 200
 
-            set_cookie_headers = [value for key, value in response.headers.multi_items() if key.lower() == "set-cookie"]
+            set_cookie_headers = [
+                value for key, value in response.headers.multi_items() if key.lower() == "set-cookie"
+            ]
             joined = "\n".join(set_cookie_headers)
 
             assert "session=single-mw-cookie" in joined, (

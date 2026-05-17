@@ -210,12 +210,12 @@ pub fn create_python_stream(
 
 /// Create a stream for SSE that sends items immediately (batch_size=1)
 /// with optional keep-alive pings when idle and optional per-event
-/// brotli compression.
+/// compression (any codec from [`StreamCodec`]).
 pub fn create_sse_stream(
     content: Py<PyAny>,
     is_async_generator: bool,
     ping_interval: Option<f64>,
-    compression: Option<crate::streaming_compression::StreamBrotliConfig>,
+    codec: Option<crate::streaming_compression::StreamCodec>,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
     let inner = create_python_stream_with_config(content, 1, 1, is_async_generator);
 
@@ -225,17 +225,18 @@ pub fn create_sse_stream(
             _ => inner,
         };
 
-    maybe_wrap_brotli(with_keepalive, compression)
+    maybe_wrap_codec(with_keepalive, codec)
 }
 
-/// Wrap a chunk stream with per-chunk brotli compression when a config is
-/// provided. When `compression` is `None`, returns the inner stream unchanged.
-pub fn maybe_wrap_brotli(
+/// Wrap a chunk stream with per-chunk compression when a codec is provided.
+/// Pass-through when `codec` is `None`. Compression runs **after** any
+/// keep-alive injection so ping frames are also flushed.
+pub fn maybe_wrap_codec(
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
-    compression: Option<crate::streaming_compression::StreamBrotliConfig>,
+    codec: Option<crate::streaming_compression::StreamCodec>,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
-    match compression {
-        Some(cfg) => Box::pin(crate::streaming_compression::BrotliStream::new(inner, cfg)),
+    match codec {
+        Some(c) => Box::pin(crate::streaming_compression::EncoderStream::new(inner, c)),
         None => inner,
     }
 }

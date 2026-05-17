@@ -12,39 +12,33 @@ use crate::response_meta::ResponseMeta;
 /// Build a streaming response with SSE headers.
 /// Pre-bundles common SSE headers to avoid multiple mutations.
 ///
-/// When `brotli_compression` is `Some`, sets `Content-Encoding: br` and
-/// `Vary: Accept-Encoding`. When `None`, sets `Content-Encoding: identity`
-/// (the historical SSE behavior — middleware skips compression).
+/// `encoding_name` is the `Content-Encoding` token to set:
+/// - `"identity"` → handler owns "no compression"; the global compression
+///   middleware bypasses (and strips) the marker.
+/// - `"br" | "gzip" | "zstd"` → handler already compressed the body
+///   per-chunk; sets `Content-Encoding` + `Vary: Accept-Encoding` so the
+///   client decodes correctly and intermediaries cache per encoding.
 #[inline]
 pub fn build_sse_response(
     status: StatusCode,
     custom_headers: Vec<(String, String)>,
-    brotli_compression: Option<&crate::streaming_compression::StreamBrotliConfig>,
+    encoding_name: &str,
 ) -> HttpResponseBuilder {
     let mut builder = HttpResponse::build(status);
 
-    // Add custom headers first
-    // Use append_header to support multiple headers with the same name
     for (k, v) in custom_headers {
         builder.append_header((k, v));
     }
 
-    // Batch SSE headers (avoid 5 separate mutations)
     builder.content_type("text/event-stream");
     builder.insert_header(("X-Accel-Buffering", "no"));
     builder.insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"));
     builder.insert_header(("Pragma", "no-cache"));
     builder.insert_header(("Expires", "0"));
 
-    match brotli_compression {
-        None => {
-            // Skip the global compression middleware via the identity marker.
-            builder.insert_header(("Content-Encoding", "identity"));
-        }
-        Some(_) => {
-            builder.insert_header(("Content-Encoding", "br"));
-            builder.insert_header(("Vary", "Accept-Encoding"));
-        }
+    builder.insert_header(("Content-Encoding", encoding_name));
+    if encoding_name != "identity" {
+        builder.insert_header(("Vary", "Accept-Encoding"));
     }
 
     builder

@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import msgspec
 
@@ -294,9 +294,6 @@ class StreamingResponse(CookieMixin):
         status_code: int = 200,
         media_type: str | None = None,
         headers: dict[str, str] | None = None,
-        compress: Literal["br"] | None = None,
-        brotli_quality: int = 5,  # should I just have a compression config dict?
-        brotli_lgwin: int = 14,  # sliding window of size 2^brotli_lgwin = 16k default
     ):
         # Validate that content is already a called generator/iterator, not a callable
         if callable(content):
@@ -312,26 +309,10 @@ class StreamingResponse(CookieMixin):
                 f"not a callable. Received: {type(content).__name__}"
             )
 
-        if compress is not None and compress != "br":
-            raise ValueError(f"StreamingResponse compress must be None or 'br', got {compress!r}")
-
-        if compress == "br":
-            if (
-                not isinstance(brotli_quality, int)
-                or isinstance(brotli_quality, bool)
-                or not (0 <= brotli_quality <= 11)
-            ):
-                raise ValueError(f"brotli_quality must be an int in [0, 11], got {brotli_quality!r}")
-            if not isinstance(brotli_lgwin, int) or isinstance(brotli_lgwin, bool) or not (10 <= brotli_lgwin <= 24):
-                raise ValueError(f"brotli_lgwin must be an int in [10, 24], got {brotli_lgwin!r}")
-
         self.content = content
         self.status_code = status_code
         self.media_type = media_type or "application/octet-stream"
         self.headers = dict(headers) if headers else {}
-        self.compress = compress
-        self.brotli_quality = brotli_quality
-        self.brotli_lgwin = brotli_lgwin
 
         # Detect generator type at instantiation time (once per request, not per chunk)
         # This avoids repeated Python inspect calls in Rust streaming loop
@@ -472,17 +453,11 @@ class EventSourceResponse(StreamingResponse):
         status_code: int = 200,
         headers: dict[str, str] | None = None,
         ping_interval: float | None = SSE_DEFAULT_PING_INTERVAL,
-        compress: Literal["br"] | None = None,
-        brotli_quality: int = 5,
-        brotli_lgwin: int = 14,  # 2^brotli_lgwin sliding window default 16k
     ):
         super().__init__(
             content,
             status_code=status_code,
             media_type="text/event-stream",
             headers=headers,
-            compress=compress,
-            brotli_quality=brotli_quality,
-            brotli_lgwin=brotli_lgwin,
         )
         self.ping_interval = ping_interval
